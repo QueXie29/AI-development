@@ -58,7 +58,7 @@
     </td>
     <td width="50%" valign="top">
       <h3>🧪 内容可以持续校验</h3>
-      <p>691 道题按 28 个专题组织，并用自动审计检查失效链接、重复题和缺少条件的数据；题目质量优先于单纯堆数量。</p>
+      <p>697 道题按 28 个专题组织，并用自动审计检查失效链接、重复题和缺少条件的数据；题目质量优先于单纯堆数量。</p>
     </td>
   </tr>
 </table>
@@ -104,7 +104,7 @@
   </tr>
 </table>
 
-<p align="center"><b>01–28 共 28 个专题、691 道题，现已全部完成逐题配图。</b></p>
+<p align="center"><b>01–28 共 28 个专题、697 道题，现已全部完成逐题配图。</b></p>
 
 <p align="center">
   <a href="docs/01-basic-concepts/">01 LLM 基础</a> ·
@@ -268,7 +268,7 @@ flowchart LR
 
 ## 📚 题库导航
 
-共 **28 个专题、691 道题**。点击分类展开完整目录。
+共 **28 个专题、697 道题**。点击分类展开完整目录。
 
 <details open>
 <summary><b>🧠 基础与模型</b> · 6 个专题 / 174 道题</summary>
@@ -299,7 +299,7 @@ flowchart LR
 
 - [05 · Agent 基础](docs/05-ai-agent-basics/) — 工具调用、状态、记忆、循环与人工确认
 - [13 · 多 Agent 系统](docs/13-multi-agent-systems/) — 协作模式、任务分配、通信与故障处理
-- [14 · MCP 与 Skills](docs/14-mcp-skill-systems/) — MCP 原语、能力发现、授权与协议安全
+- [14 · MCP 与 Skills](docs/14-mcp-skill-systems/) — MCP 原语、能力发现、JSON-RPC 错误码、Root 访问控制、Transport 选型、多 Server 编排、规范演进、可观测性
 - [22 · Agent 规划与反思](docs/22-agent-planning-reflection/) — 规划、重规划、验证、反思和终止
 - [23 · Agent 可观测性](docs/23-agent-observability/) — Trace、指标、评估、告警与成本归因
 

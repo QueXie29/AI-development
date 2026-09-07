@@ -4728,6 +4728,409 @@ Skill（技能）是把 **Prompt 模板 + 处理流程 + 工具调用 + 输出�
 
 </details>
 
+### Q40: MCP 使用 JSON-RPC 2.0 通信，标准错误码有哪些？服务端如何做错误处理和诊断？
+
+> 面试中面试官经常追问 MCP 的底层协议细节。JSON-RPC 是 MCP 的消息层，理解错误码和诊断模式能体现你不止会调 SDK。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**MCP 的协议层：**
+
+MCP 所有消息都走 **JSON-RPC 2.0**，transport 可以是 stdio 或 Streamable HTTP。不管哪种 transport，消息格式都是 JSON-RPC 2.0 frame。这是面试区分度最高的考点之一——很多人只会调 Python SDK，但说不清底层的错误码体系。
+
+**标准 JSON-RPC 错误码（必须记住前几个）：**
+
+| 错误码 | 含义 | MCP 场景示例 |
+|--------|------|-------------|
+| `-32700` | Parse error | JSON 格式不对，消息无法解析 |
+| `-32600` | Invalid Request | 字段缺失、类型错误 |
+| `-32601` | Method not found | 调了 Server 未注册的工具名 |
+| `-32602` | Invalid Params | 工具参数类型不匹配或缺少必填字段 |
+| `-32603` | Internal error | Server 内部异常（业务逻辑报错） |
+| `-32606` | Unsupported method version | 用了新版方法但 Server 不支持 |
+| `-32609` | Server not started | Server 还没初始化完成就发了请求 |
+| `-32000 ~ -32099` | 服务保留错误 | MCP 自定义的业务级错误 |
+
+**错误处理最佳实践：**
+
+```python
+# ✅ 好的做法：给 AI 可读的错误信息 + 结构化 data
+@app.tool(name="search_db")
+def search_db(user_id: str):
+    try:
+        results = db.query(f"SELECT * FROM orders WHERE user_id = '{user_id}'")
+        return {"results": results, "total": len(results)}
+    except ConnectionError as e:
+        # 返回 -32603 + 清晰的 data，AI 能看到提示词重新生成
+        raise ToolError(
+            code=-32603,
+            message=f"数据库连接失败，请 30s 后重试", 
+            data={"retry_after_seconds": 30, "service": "orders-db"}
+        )
+    except ValueError as e:
+        # 参数校验错误 → -32602
+        raise ToolError(code=-32602, message=f"无效的用户ID: {user_id}")
+```
+
+**诊断三板斧：**
+
+1. **看 Error Code**：快速定位问题类型（参数错 vs 服务不可用）
+2. **看 data 字段**：结构化数据里通常有 `service`、`retry_after_seconds` 等线索
+3. **查 Server 日志**：结合 `message` + `data` + 服务端 trace ID，三管齐下定位根因
+
+**面试话术：**
+> "MCP 跑在 JSON-RPC 2.0 之上，错误码要记住关键的几个：-32700 解析错误、-32601 方法不存在、-32602 参数错误、-32603 内部错误。我做 Server 时，业务异常一律包装成 ToolError 带 data payload，这样 AI 客户端能自动判断重试还是换方案。诊断的时候先看错误码缩小范围，再查 data 里的 service 和 retry 信息，最后拉服务端日志，三步就能定位到具体原因。"
+
+</details>
+
+### Q41: MCP 的 Root 是什么？它在文件访问控制和多工作区场景中的作用？
+
+> MCP 的 Roots 概念是面试中容易被忽略但实际非常重要的设计。它决定了 Server 能访问哪些文件系统路径，是安全沙箱的核心机制。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**Root 定义：**
+
+MCP Root 是 Host（如 Claude Code、Cursor）告诉 Server「你可以访问这些目录」的方式。每个 Root 包含一个 URI 路径和一个可选的名称。Server 只能访问被显式声明为 Root 的文件，不能随意读取用户机器上的其他文件。这是 MCP 的安全沙箱基础。
+
+**核心 API：**
+
+```json
+// 1. 客户端列出可用的 Roots（启动时由 Host 推送）
+{"jsonrpc":"2.0","method":"roots/list","params":{}}
+// Server 响应可用 roots
+{"jsonrpc":"2.0","result":{"roots":[
+  {"uri":"file:///home/user/project","name":"Workspace"}
+]}}
+
+// 2. Server 监听 root 变更通知
+{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}
+// 说明有新的 root 被添加或现有 root 被移除
+```
+
+**实际场景中的 Root 管理：**
+
+| 场景 | Root 如何变化 | Server 行为 |
+|------|---------------|-------------|
+| 打开单项目 | Host 推送 `/path/to/project` 为 Root | Server 可读写该目录下文件 |
+| 拖入第二个项目 | Host 新增一个 Root | Server 收到 list_changed 通知，更新可用文件列表 |
+| 关闭项目窗口 | 对应 Root 被移除 | Server 停止访问该路径 |
+| Git Submodule | Submodule 路径作为子 Root 加入 | Server 跨项目操作代码 |
+
+**为什么重要——面试中的工程取舍：**
+
+- **安全性**：Root 限制了 Server 的「可见文件」范围，即使 Server 有恶意也无法读取不受信目录；
+- **性能**：Server 只需扫描 Root 下的文件索引，不用遍历整个文件系统；
+- **多租户**：IDE 可以同时打开多个项目（多个 Root），MCP Server 通过 URI 区分不同项目的上下文。
+
+**面试话术：**
+> "MCP 的 Root 本质上是文件系统沙箱——Host 决定暴露哪些目录给 Server。我的实践中，Claude Code 打开 monorepo 时会把所有 workspace 目录注册为不同的 Root，MCP Server 收到 root/list 后建立文件索引。当需要跨目录搜索时，它会先查 available Roots 确定边界，不会去碰 /etc 这种敏感路径。多项目管理时每个 Root 对应一个命名空间，Server 通过 URI 路由避免混淆。简单一句话：Root 就是 AI 能看到的文件系统地图边界。"
+
+</details>
+
+### Q42: MCP Transport 怎么选？stdio、SSE 和 Streamable HTTP 各自适用什么生产场景？
+
+> Transport 选型直接决定你的 MCP Server 能不能上生产。面试官会问的是「你了解各种方案的优缺点吗」「你在真实场景中怎么选」。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**三种 Transport 对比：**
+
+| 维度 | stdio | SSE (已废弃) | Streamable HTTP (当前标准) |
+|------|-------|-------------|---------------------------|
+| 进程模型 | Client 启动 Server 为子进程 | Server 独立运行，持久 HTTP 连接 | Server 独立运行，每请求一 HTTP |
+| 消息通道 | stdin/stdout 单向流 | POST endpoint + SSE stream | POST endpoint（单端点） |
+| 延迟 | ~0ms（本地进程间） | 持久连接开销 | 网络 RTT + HTTP overhead (~10ms) |
+| 认证 | 无（本地信任域内） | 无（依赖网络层） | 完整 OAuth 2.1 / JWT |
+| 多客户端 | 不支持（一进程一 client） | 支持（共享 SSE endpoint） | 支持（天然水平扩展） |
+| 重启/升级 | 需 restart subprocess | 需 drain connections | 零停机（stateless） |
+| 推荐场景 | Claude Desktop / Cursor 本地开发 | ~~已废弃~~ | **生产部署首选** |
+
+**选型决策树：**
+
+```
+你的 MCP Server 在哪里运行？
+├── 同一台机器的本地进程？
+│   └── ✅ stdio（最低延迟、最简单，Claude Code/Cursor 默认）
+└── 需要在网络上被多个客户端访问？
+    └── ✅ Streamable HTTP（生产标准，支持认证/限流/水平扩展）
+```
+
+**注意 2026-07-28 规范变更：**
+
+> SSE Transport 已在 MCP spec 2026-07-28 中被**正式废弃**。新规范要求所有远程部署使用 Streamable HTTP。如果还在用 SSE，现在是迁移的最佳时机。
+
+**Streamable HTTP 生产配置要点：**
+
+```nginx
+# Nginx 反向代理 MCP Server（生产环境标配）
+location /mcp {
+    proxy_pass http://mcp-server:3000;
+    proxy_set_header Host $host;
+    # MCP 专用 header（2026-07-28 新增）
+    proxy_set_header MCP-Method $request_method;
+    proxy_set_header MCP-Name mcp-server;
+    # 超时设置：长任务需要合理 timeout
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+}
+```
+
+**面试话术：**
+> "Transport 选型很简单：本地进程用 stdio，线上用 Streamable HTTP。我在生产上全部走的 Streamable HTTP，前面加 Nginx 做反代和限流，后端 MCP Server 无状态可以水平扩。关键区别是 SSE 已经废弃了，新的 MCP spec 要求所有远程部署都用 Streamable HTTP，它是 stateless 的，每个请求独立处理，天然支持负载均衡和多实例部署。如果面试官说他们还在用 SSE，我会提醒他尽快迁移。"
+
+</details>
+
+### Q43: 一个 Agent 同时对接多个 MCP Server 时，如何编排协作与冲突解决？
+
+> 生产中很少只跑一个 MCP Server——通常会有数据库 Server、GitHub Server、Slack Server、RAG Server 等多个并存。多 Server 编排是实战高频题。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**多 Server 架构全景图：**
+
+```
+               ┌─────────────────────────────┐
+               │       Host / Agent          │
+               │  ┌─────────────────────────┐ │
+               │  │  Prompt + 规划决策引擎   │ │
+               │  └─────────────────────────┘ │
+               │           ↕                  │
+               │  ┌──────┐ ┌──────┐ ┌──────┐ │
+               │  │Client│ │Client│ │Client│ │ ← 一个 Server 一个 Client
+               │  │  A   │ │  B   │ │  C   │ │
+               │  └──┬───┘ └──┬───┘ └──┬───┘ │
+               │     │        │        │      │
+               └─────┼────────┼────────┼──────┘
+                     │        │        │
+              ┌──────▼──┐ ┌──▼─────┐ ┌▼──────────┐
+              │ DB Srv  │ │ GitHub │ │ RAG Srv   │
+              │         │ │ Srv    │ │           │
+              └─────────┘ └────────┘ └───────────┘
+```
+
+**冲突与协调策略：**
+
+1. **工具名冲突检测**：不同 Server 可能注册同名工具（如两个 Server 都有 `read_file`）。Host 需要维护全局命名空间：
+   - 方案 A：用 `server_name__tool_name` 双冒号命名（如 `github__list_issues`, `db__read_query`）
+   - 方案 B：按优先级排序，高优先级 Server 的工具覆盖低优先级的同名工具
+
+2. **结果融合**：多个 Server 并行调用时，Host 负责聚合结果并按语义分组展示给 LLM。
+
+3. **依赖链路**：上游 Server 的输出可能是下游 Server 的输入（如从 DB 读到 customer_id，再用 github__get_pr 关联 PR）。
+
+4. **超时与熔断**：某个 Server 挂掉不应阻塞整体流程：
+   ```python
+   # 伪代码：多 Server 并行调用 + 超时控制
+   async def multi_server_agent(query):
+       tasks = [
+           server_a.call_tool("search", query),     # 30s 超时
+           server_b.call_tool("fetch_docs", query),  # 20s 超时
+           server_c.call_tool("count_metrics", {}),  # 10s 超时
+       ]
+       results = await asyncio.gather(*tasks, return_exceptions=True)
+       # 过滤掉超时的 Server，用剩余结果继续
+       valid_results = [r for r in results if isinstance(r, dict)]
+       if not valid_results:
+           raise ServiceUnavailableError("所有下游服务均不可用")
+       return process_partial_output(valid_results)
+   ```
+
+5. **资源隔离**：每个 Server 有独立的认证凭据和 Rate Limit，Host 做统一调度。
+
+**常见面试陷阱题：**
+> 「三个 MCP Server 并行调用，其中两个返回部分结果但超时了，第三个完全正常但内容不够全面——你怎么处理？」
+> 正确思路：不要等所有都完成，而是根据 timeout 策略和 Server SLA 做 graceful degradation，优先保证核心路径可用。
+
+**面试话术：**
+> "我搭过一个多 Server 编排架构：DB、GitHub、RAG 三个 MCP Server，Host 统一管理连接池和超时策略。工具命名用 `server__tool` 格式避免冲突，调用时用 async gather 并行发起，谁超时了就跳过谁的分支继续往下走。最关键的决策点是定义每个 Server 的 SLA——核心的比如 DB 查询必须快（10s 超时），边缘的如 RAG 文档检索可以慢（30s），整体超时控制在 60s 以内。这样即使某个 Server 变慢了也不会卡死整个 Agent。"
+
+</details>
+
+### Q44: MCP 2026-07-28 规范有哪些重大变更？对现有 Server 有什么影响？
+
+> 这是 2026 年下半年最前沿的知识点。如果你还能答出 MCP spec 的版本演进路线和新特性，面试竞争力直接拉满。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**MCP 规范的演进时间线：**
+
+| 版本日期 | 关键变更 |
+|----------|---------|
+| 2024-11-25 | MCP 发布，首个版本 |
+| 2025-03-26 | 引入 SSE Transport |
+| 2025-06-15 | SSE 废弃，转向 Streamable HTTP |
+| 2025-11-25 | SSE 正式废弃 |
+| **2026-07-28** | **最大修订版**：无状态化、Multi Round-Trip Requests、SEP 系列提案落地 |
+
+**2026-07-28 四大核心变更：**
+
+**1️⃣ 协议无状态化（Stateless Core）**
+
+旧方式：`initialize` handshake → 获取 `Mcp-Session-Id` → 后续请求携带 session
+新方式：**彻底去掉 initialize 和 Session-Id**，每次请求在 `_meta` 里带上协议版本和能力信息：
+
+```json
+// 旧版（已废弃）
+{"jsonrpc":"2.0","id":1,"method":"initialize",
+  "params":{"protocolVersion":"2025-11-25","capabilities":{}}}
+
+// 新版（当前）
+{"jsonrpc":"2.0","method":"tools/call",
+  "params":{"name":"search","arguments":{"q":"test"}},
+  "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+           "clientInfo":{"name":"my-app","version":"1.0"}}}
+```
+
+影响：Server 不再需要维护 session 存储，可直接水平扩展到任意数量的 Pod/实例。
+
+**2️⃣ server/discover RPC**
+
+旧方式：客户端连上后等 initialize 响应来发现 Server 能力。
+新方式：新增 `server/discover` 方法，客户端在无连接状态下即可获取 Server 的能力清单：
+
+```json
+// 无需先 handshake，直接 discover
+{"jsonrpc":"2.0","id":1,"method":"server/discover"}
+```
+
+影响：Server 可在不建立会话的情况下被评估和筛选，加速了 Server Registry 生态的发展。
+
+**3️⃣ Multi Round-Trip Requests（InputRequiredResult）**
+
+旧方式：Server 通过打开的 SSE 连接向 Client push  elicitation/sampling 请求。
+新方式：Server 返回特殊结构 `InputRequiredResult`，Client 收集回答后带着 `requestState` 重发原请求：
+
+```json
+{
+  "resultType": "input_required",
+  "inputRequests": {
+    "confirm": {"type": "elicitation", "message": "删除这3个文件?"}
+  },
+  "requestState": "eyJzdGVwIjoxLCJmaWxlcyI6WyJhIiwiYiIsImMiXX0="
+}
+```
+
+影响：消除了对持久连接的依赖，使多轮交互也变成 stateless 可重试的模式。任何 Server 实例都能处理重发的请求。
+
+**4️⃣ Mcp-Method / Mcp-Name 必备 HTTP Header（SEP-2243）**
+
+每个 HTTP 请求必须携带 `Mcp-Method` 和 `Mcp-Name` header，使得网关可以直接基于 header 做 rate limiting、计费、trace，而不必解析 JSON body。
+
+**迁移 Checklist（2026年底截止）：**
+
+- [ ] 移除 `initialize`/`initialized` 调用逻辑
+- [ ] 检查并清除 `Mcp-Session-Id` 相关代码
+- [ ] 实现 `server/discover` handler
+- [ ] 迁移 elicitation/sampling 到 `InputRequiredResult` 模式
+- [ ] 更新 HTTP Gateway 配置添加必备的 `Mcp-Method`/`Mcp-Name` headers
+- [ ] 将 `-32002`（旧的不支持协议版本错误码）改为 `-32602`（Invalid Params）
+
+**面试话术：**
+> "MCP 2026-07-28 是我最近一直在跟踪的规范演进。最大的变化是把整个协议核心变成了无状态的——去掉 initialize handshake、去掉 Session-Id，每次请求自己声明协议版本。还引入了 server/discover 让没有连接的客户端也能发现 Server 能力。以前 SSE 里那些 server-push 的 elicitation 现在改成了 InputRequiredResult，客户端拿到 answer 后带着 requestState 重试就行。这对我们 Server 来说好处很大：完全 Stateless，随便扩节点，不需要 sticky session。不过意味着之前的代码得改，特别是涉及 Session 管理和 elicitation 的部分。我计划 Q3 就把我们的 MCP Server 迁移到这个版本。"
+
+</details>
+
+### Q45: MCP Server 上线后如何做可观测性？监控什么指标？怎么排查问题？
+
+> 「你做了这么多东西，上线了怎么看健康状态？」这是几乎所有技术面试都会追问的实战题。回答可观测性要从 metrics、logs、traces 三个维度展开。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**MCP Server 可观测性三层架构：**
+
+```
+                ┌──────────────────────────────────────┐
+                │         Dashboard / Alerting         │
+                │  Grafana + PagerDuty + Slack Alerts   │
+                └────────────────┬─────────────────────┘
+                                 │
+         ┌───────────────────────┼───────────────────────┐
+         │                       │                       │
+    ┌────▼────┐            ┌─────▼─────┐           ┌─────▼─────┐
+    │ Metrics │            │  Logs     │           │  Traces   │
+    │ Prometheus│          │ Structured│           │ Jaeger/   │
+    │ +Alertmanager │     │ JSON Logs │           │ OpenTelemetry│
+    └─────────┘            └───────────┘           └───────────┘
+```
+
+**关键监控指标（必须记住）：**
+
+| 指标类别 | 具体指标 | 告警阈值参考 |
+|----------|---------|-------------|
+| **延迟** | `request_duration_seconds`（P50/P95/P99） | P99 > 5s 触发 warning |
+| **吞吐量** | `requests_total` by tool name | TPS 突降 50% 告警 |
+| **错误率** | `errors_total` by error code | 错误率 > 5% 持续 5min 告警 |
+| **并发** | `active_connections` | 超过连接池上限 80% 预警 |
+| **缓存命中** | `cache_hit_ratio` | 命中率 < 30% 说明缓存策略需调整 |
+| **Tool 调用量** | `tool_calls_total` per tool | Top N 工具用量突增可能是异常流量 |
+
+**结构化日志模板（含 correlation_id）：**
+
+```python
+import logging
+
+class MCPPublisher:
+    def __init__(self, logger):
+        self.logger = logger
+    
+    def on_tool_call(self, correlation_id: str, tool_name: str, args: dict):
+        self.logger.info({
+            "event": "tool_call_started",
+            "correlation_id": correlation_id,
+            "tool_name": tool_name,
+            "args_keys": list(args.keys()),  # 不包含敏感值
+        })
+    
+    def on_tool_success(self, correlation_id: str, tool_name: str, duration_ms: float):
+        self.logger.info({
+            "event": "tool_call_completed",
+            "correlation_id": correlation_id,
+            "tool_name": tool_name,
+            "duration_ms": round(duration_ms, 2),
+        })
+    
+    def on_tool_error(self, correlation_id: str, tool_name: str, error_code: int, error_msg: str):
+        self.logger.error({
+            "event": "tool_call_failed",
+            "correlation_id": correlation_id,
+            "tool_name": tool_name,
+            "error_code": error_code,
+            "error_message": error_msg,
+        })
+```
+
+**排查问题的标准 SOP：**
+
+1. **Dashboard 确认异常**：看 Metrics Dashboard，确认是延迟飙升、错误增加、还是流量异常
+2. **Trace 追踪**：拿 `correlation_id` 进 Jaeger/OpenTelemetry，看到完整的请求链路，锁定耗时最高的 Span
+3. **Log 深挖**：用 `correlation_id` 搜结构化日志，确认是哪个 Tool 出的问题、传了什么参数
+4. **复现 & 修复**：本地用同样的输入参数模拟，复现问题后修复验证
+
+**成本归因（加分项）：**
+
+```python
+# 每个 MCP Server 调用都要计「成本」
+cost_per_call = {
+    "db_search": {"currency": "$", "cost": 0.0001, "tokens_used": 0},  # 纯计算，无 token 消耗
+    "web_scrape": {"currency": "$", "cost": 0.005, "tokens_used": 1024},  # 调了 LLM
+    "image_gen": {"currency": "$", "cost": 0.04, "tokens_used": 0},  # 图片生成 API
+}
+```
+
+> 面试官关注成本归因，因为企业老板会问「这个功能一天花多少钱」。你能把 MCP 调用的每一笔 cost 算清楚，就是加分。
+
+**面试话术：**
+> "MCP Server 的可观测性我分三层做：Metrics 看大盘（P95 延迟、错误率、QPS），Logs 看细节（structured JSON + correlation_id 串联全链路），Traces 串起来端到端（Jaeger + OpenTelemetry）。每个 Tool 调用都打 trace span，记录 duration 和 error code。告警方面，P99 延迟超过 5 秒、错误率连续 5 分钟超过 5%，就会触发 PagerDuty 告警推送到 Slack。另外我还做 cost 归因，每个 Tool 调用的成本和 token 数都记录下来，月度报表可以看到哪个功能最烧钱，这就是为什么我把 observability 放在生产就绪的关键环节。"
+
+</details>
+
 ---
 
 **上一模块：** [多Agent系统](../13-multi-agent-systems/)
