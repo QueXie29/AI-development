@@ -593,11 +593,17 @@ promptfoo eval --prompts prompt_a.yaml --prompts prompt_b.yaml
 | **多模态** | 图片理解、OCR 增强 |
 | **小模型蒸馏** | 大模型教小模型 |
 | **边缘 AI** | 本地部署、隐私保护 |
+| **GraphRAG** | 知识图谱+RAG，解决跨文档碎片化检索问题 |
+| **Self-RAG** | 模型自决定是否检索，自适应检索增强生成 |
+| **MoE** | 稀疏专家路由，总参放大但激活不变 |
+| **DPO vs RLHF** | DPO单步优化对齐，无需训练Reward Model |
+| **语义缓存** | 基于嵌入相似度的LLM调用缓存，降本利器 |
 
 ## 📝 更新记录
 
 | 日期 | 更新内容 |
 |------|----------|
+| 2026-09-10 | 新增Q19-Q23：GraphRAG原理与生产局限、Self-RAG自适应检索、RAG评估体系(RAGAS/TruLens/DeepEval)、DPO vs RLHF对齐方法演进、MoE架构原理与负载均衡 |
 | 2026-04-30 | 新增Q12 Process Reward Model（PRM）详解；修复Q13重复问题 |
 | 2026-04-06 | 新增Q8企业级AI四层黄金架构；更新Module13新增Q12-Q13 A2A协议与四层架构 |
 | 2026-03-03 | 新增 AI 应用开发高级专题面试题 10 道 |
@@ -1341,7 +1347,7 @@ else:
 </details>
 
 ---
-*版本: v3.2 | 更新: 2026-04-30 | by 二狗子 🐕*
+*版本: v3.3 | 更新: 2026-09-10 | by 二狗子 🐕*
 
 ---
 
@@ -1482,5 +1488,281 @@ else:
 | Coze | ⚠️ 部分支持 | 主要通过API集成 |
 | FastGPT | ❌ 暂无 | 专注知识库 |
 | RAGFlow | ❌ 暂无 | 专注RAG |
+
+</details>
+
+### Q19: 什么是GraphRAG？与传统向量RAG相比有什么优势和局限？
+
+<a href="../../assets/illustrations/15-advanced-topics/q19-graphrag-vs-vector-rag.webp"><img src="../../assets/illustrations/15-advanced-topics/q19-graphrag-vs-vector-rag.webp" alt="GraphRAG知识图谱索引与向量RAG碎片化检索对比图解" width="100%"></a>
+
+> 🧠 **图解记忆：** 传统RAG只搜片段，GraphRAG建关系网——跨文档推理必须用图，简单问答没必要上图。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**GraphRAG = Knowledge Graph + RAG**，由微软提出（2024年9月发布）。它的核心思想是：纯向量检索只能做到"片段级相似"，无法理解实体间关系。GraphRAG通过构建知识图谱来解决这个问题。
+
+**为什么需要GraphRAG？**
+
+| 问题 | 传统向量RAG | GraphRAG |
+|------|-------------|----------|
+| 跨文档关联推理 | ❌ 搜索碎片化，答案片面 | ✅ 沿图谱游走找到多跳路径 |
+| 全局总结性查询 | ❌ 无法回答"整体怎么看" | ✅ 社区摘要聚合形成全景 |
+| 复杂实体关系问答 | ❌ 语义匹配不够精确 | ✅ 显式表达实体+关系 |
+| 相同词汇不同含义 | ❌ 同名同义词混淆 | ✅ 通过实体消歧解决 |
+
+**GraphRAG的五大生产痛点：**
+```
+1. 构建成本极高 → 每个分块都需要LLM调用提取实体/关系，百万级文档成本巨大
+2. 增量更新困难 → 新增文档不只是追加，可能需要重新做社区检测、重新生成摘要
+3. 实时性差 → 每次更新都要触发完整的图谱重建流程
+4. 调试困难 → 当答案错误时，很难定位是图谱构建阶段还是检索阶段的问题
+5. 不一定更优 → 对于单文档问答、常识性问题，传统RAG可能更好、更快、更便宜
+```
+
+**适用场景判断：**
+
+| 适合 GraphRAG | 不适合 GraphRAG |
+|---------------|----------------|
+| 需要跨文档综合回答 | 单文档问答 |
+| 实体关系查询（谁跟谁有关） | 事实查询（某个具体值） |
+| 全球综述类问题（"整体趋势怎样"） | 精确数值查询 |
+| 法律/金融分析场景 | 快速原型验证 |
+| 大规模企业知识库（>10万篇文档） | 中小规模知识库（<1万篇） |
+
+**面试话术：**
+> "GraphRAG的核心创新是引入了知识图谱结构来弥补向量检索的碎片化问题。但在实际项目中我不会盲目上GraphRAG——先看查询类型：如果主要是实体关系查询和全局总结，值得投入；如果是简单的事实查询，传统RAG加混合检索效果更好且成本低得多。我的评估标准是：当需要跨多篇文档综合回答时才引入知识图谱。"
+
+</details>
+
+### Q20: Self-RAG是什么？自适应检索如何解决传统RAG的固定检索问题？
+
+<a href="../../assets/illustrations/15-advanced-topics/q20-self-rag-adaptive.webp"><img src="../../assets/illustrations/15-advanced-topics/q20-self-rag-adaptive.webp" alt="Self-RAG按需检索与自我反思决策流图解" width="100%"></a>
+
+> 🧠 **图解记忆：** 传统RAG不管需不需要都去查，Self-RAG让模型自己决定要不要查、查得够不够、答得对不对。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**Self-RAG核心理念：** 传统RAG对每个查询都做固定数量的检索，但有些问题根本不需要检索（常识性问题），有些需要多次检索。Self-RAG训练一个统一的模型，让它能够：(1) 自主决定是否检索；(2) 评估检索结果的相关性；(3) 验证生成的内容。
+
+**四大反射Token机制：**
+
+| Token | 含义 | 作用 |
+|-------|------|------|
+| `<|Retrieve>|` | 是否需要检索 | 判断该问题是否值得检索外部知识 |
+| `<|IsRel>|` | 检索结果是否相关 | 过滤掉无关的检索段落 |
+| `<|IsSup>|` | 生成内容是否有依据 | 确保每句话都有检索来源支撑 |
+| `<|IsUse>|` | 检索内容是否实用 | 评估检索结果对当前任务的实际帮助度 |
+
+**自适应检索的三种模式：**
+```python
+# 模式1：阈值驱动
+if P(Retrieve) > threshold:
+    documents = retriever.search(query)
+else:
+    # 直接生成，跳过检索
+    answer = model.generate(query)
+
+# 模式2：迭代优化（多轮检索）
+retrieved_docs = []
+for i in range(max_iterations):
+    docs = retriever.search(query + current_context)
+    relevance_scores = evaluate_relevance(docs)
+    retrieved_docs.extend(filter_high_relevance(docs, relevance_scores))
+    if all_high_quality(relevance_scores):
+        break  # 早停
+
+# 模式3：基于生成的树解码
+candidates = tree_decode(model, query, top_k=5)
+best_answer = max(candidates, key=score_fn)
+```
+
+**与传统Pipeline-RAG对比：**
+
+| 维度 | Pipeline-RAG | Self-RAG |
+|------|-------------|----------|
+| 检索策略 | 固定检索k个文档 | 自适应，可0~N次检索 |
+| 结果评估 | 通常不做二次过滤 | 逐段相关性评分 |
+| 生成验证 | 无 | 逐句有据性验证 |
+| 可控性 | 低（一旦入管道就无法干预） | 高（可调整各种token阈值） |
+| 延迟 | 较低（固定链路） | 较高（条件分支+多次LLM调用） |
+
+**面试话术：**
+> "Self-RAG的本质是让检索从'被动执行'变成'主动决策'。在工业界，我发现大约30-50%的用户查询根本不需要检索（自我介绍、闲聊等），强制检索反而浪费资源、增加幻觉风险。Self-RAG的反射token机制让模型学会判断'什么时候不检索就是最好的检索策略'。不过自部署难度较高，因为需要专门的数据标注和模型训练。"
+
+</details>
+
+### Q21: RAG系统上线后怎么评估效果？RAGAS vs TruLens vs DeepEval 怎么选？
+
+<a href="../../assets/illustrations/15-advanced-topics/q21-rag-evaluation.webp"><img src="../../assets/illustrations/15-advanced-topics/q21-rag-evaluation.webp" alt="RAG评估四层指标体系：检索质量→忠实度→答案质量→业务指标" width="100%"></a>
+
+> 🧠 **图解记忆：** RAG不能只用一个"准确率"衡量——检索查准率、召回率、回答忠实度各看各的，缺一不可。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**RAG的三个独立失败面：**
+1. **检索质量**：有没有把对的文档捞出来？
+2. **回答忠实度**：生成的答案有没有脱离上下文瞎编？
+3. **答案相关性**：回答到底有没有解决问题？
+
+这四个RAGAS核心指标各有侧重，缺一不可：
+
+| 指标 | 维度 | 定义 | 典型阈值 | 低了意味着什么 |
+|------|------|------|---------|--------------|
+| **Context Precision** | 检索 | 被召回的文档中有多少是真正相关的 | >0.7 | 检索器引入噪声 |
+| **Context Recall** | 检索 | 回答问题所需的信息是否都被召回了 | >0.6 | 检索范围不够 |
+| **Faithfulness** | 生成 | 答案中的每句话是否都能追溯到上下文中 | >0.8 | 模型有幻觉 |
+| **Answer Relevancy** | 生成 | 答案是否直接回答了原始问题 | >0.7 | 答案跑题 |
+
+**三大框架选型对比：**
+
+| 特性 | RAGAS | TruLens | DeepEval |
+|------|-------|---------|----------|
+| **定位** | 纯评估指标库 | 评估+可观测性平台 | 测试框架+指标 |
+| **实时追踪** | ❌ 离线批处理 | ✅ Live tracing | ⚠️ 有限支持 |
+| **参考依赖** | 无需ground truth（faithfulness等） | 需要trace数据 | 推荐有参考 |
+| **Dashboard** | ❌ | ✅ Web UI | ❌ |
+| **CI集成** | ✅ Python API | ✅ SDK | ✅ pytest插件 |
+| **免费程度** | Apache 2.0全开源 | 开源+Pro版 | 核心开源+付费 |
+| **最佳场景** | CI回归测试、批量评估 | 实时监控、线上诊断 | TDD-style测试 |
+
+**代码示例：RAGAS评估管线**
+```python
+from ragas import evaluate
+from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
+import pandas as pd
+
+# 构建评估数据集（需要question/context/ground_truth/answer四个字段）
+data_sample = {
+    "question": ["公司的现金流状况如何？", "主要竞争对手是谁？"],
+    "ground_truth": ["2024年Q3现金流为负，主因是研发投入增加", "主要竞争对手是A公司和B公司"],
+    "answer": [model.generate(q) for q in dataset["question"]],
+}
+
+dataset = Dataset.from_dict(data_sample)
+
+result = evaluate(
+    dataset=dataset,
+    metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
+    llm=judge_llm,
+    embeddings=embedding_model,
+)
+print(result.to_pandas())
+```
+
+**面试话术：**
+> "评价RAG效果我从来不只看一个准确率分数，而是拆成四层：检索查准率（context precision）、检索召回率（context recall）、回答忠实度（faithfulness）、答案相关性（answer relevancy）。CI里跑RAGAS做回归测试，线上用TruLens做实时监控。如果看到faithfulness掉了但precision没变，说明是Prompt或模型的问题，不是检索的问题——这种分层排查思路比拍脑袋改配置强太多了。"
+
+</details>
+
+### Q22: RLHF和DPO有什么区别？2026年主流对齐方法还有哪些演进？
+
+<a href="../../assets/illustrations/15-advanced-topics/q22-alignment-evolution.webp"><img src="../../assets/illustrations/15-advanced-topics/q22-alignment-evolution.webp" alt="RLHF-PPO-DPO-GPPO-GRPO各代对齐方法的演进路线和解耦原理" width="100%"></a>
+
+> 🧠 **图解记忆：** RLHF三件套（reward model/PPO/refine），DPO一步到位——不训reward model直接优化策略。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**RLHF的标准流程（三层架构）：**
+
+```
+步骤1：收集人类偏好数据
+  → 对同一prompt的不同回答排序 → 得到 (chosen, rejected) 偏好对
+
+步骤2：训练 Reward Model (RM)
+  → 给定prompt+response，输出一个标量得分
+  → 目标：chosen得分 > rejected得分
+
+步骤3：用PPO微调LLM
+  → 以Reward Model给出的奖励作为信号
+  → 约束：不要偏离预训练模型太远（KL惩罚）
+```
+
+**DPO（Direct Preference Optimization）的革命性简化：**
+
+DPO的关键洞察：**PPO优化等价于直接优化策略模型**，绕过了reward model。
+
+```
+RLHF:  preference data → Train RM → PPO optimize policy (两阶段、不稳定)
+DPO:   preference data → Directly optimize policy (单阶段、稳定)
+```
+
+**DPO vs RLHF对比：**
+
+| 维度 | RLHF (PPO) | DPO |
+|------|------------|-----|
+| 训练阶段 | 两步（训RM + PPO） | 一步（直接优化policy） |
+| 稳定性 | PPO超参敏感，常崩溃 | 训练稳定，类似SFT |
+| 算力需求 | 高（需要额外存RM） | 低（不需要RM） |
+| 实现复杂度 | 高（TRL + Ray） | 低（标准PyTorch即可） |
+| 效果上限 | 理论上更高 | 接近RLHF但略低 |
+| 工业落地 | OpenAI早期做法 | 多数现代模型的默认选择 |
+
+**2026年前沿对齐方法：**
+
+| 方法 | 全称 | 关键创新 | 代表 |
+|------|------|---------|------|
+| **GRPO** | Group Relative Policy Optimization | 用group内相对排名替代绝对reward，无需RM | DeepSeek R1 |
+| **DAPO** | Dynamic Augmented DPO | DPO基础上引入动态数据增强 | 阿里 |
+| **GSPO** | Guidance-guided SPO | 用辅助指导信号引导策略优化 | Meta |
+| **IPO** | Identity Regularized Preference Optimization | 理论推导的DPO正则化版本 | 学术 |
+| **KTO** | Kahneman-Tversky Optimization | 不用成对偏好数据，只需要好坏标签 | Meta |
+
+**面试话术：**
+> "2026年做模型对齐，DPO已经成为工业界的默认选择。RLHF虽然效果好，但PPO的训练不稳定性和RM训练成本太高。DeepSeek R1用的GRPO更进一步——连reward model都不需要，直接用组内相对比较来引导优化。面试时如果能说出'DPO把三件套简化为一件'这个类比，同时知道GRPO的相对排名思想，说明你对齐领域不仅会用还会思考。"
+
+</details>
+
+### Q23: MoE（Mixture of Experts）如何在不增加推理成本的情况下扩大模型规模？
+
+<a href="../../assets/illustrations/15-advanced-topics/q23-moe-scaling.webp"><img src="../../assets/illustrations/15-advanced-topics/q23-moe-scaling.webp" alt="MoE稀疏路由机制与专家负载均衡调度图解" width="100%"></a>
+
+> 🧠 **图解记忆：** Dense模型每个token过全部参数，MoE只让top-k专家工作——总参暴涨、激活不变。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**MoE的核心公式：激活参数 ≠ 总参数**
+
+在Dense Transformer中，每个token经过所有FFN层的参数。在MoE中：
+```
+Dense:    FLOPs ∝ N_total（所有参数都参与计算）
+Sparse MOE: FLOPs ∝ N_active（只有top-k专家参与计算）
+```
+
+以Mixtral 8x7B为例：总参56B，但每token只激活2个专家×7B=14B。**用4倍容量换来几乎相同的推理成本。**
+
+**MoE三大核心组件：**
+
+| 组件 | 职责 | 关键技术点 |
+|------|------|-----------|
+| **Router/Gate** | 决定token分配给哪个专家 | Softmax vs Top-K路由，负载均衡loss |
+| **Experts** | 实际的FFN子网络 | 独立参数矩阵，学习不同知识 |
+| **Load Balancing** | 防止某些专家过载或空闲 | Auxiliary loss, Expert bias, Capacity factor |
+
+**DeepSeek-V3的MoE设计（2026面试最热话题）：**
+```
+普通MoE:     8 experts, token选Top-1
+Fine-grained: 256 experts + 1 shared expert, token选Top-4
+              总参: 671B, 激活参: 37B (比例 18x!)
+              
+Shared Expert: 给所有token提供通用知识基础
+                ↓
+Fine-grained:  细粒度专家处理特定领域的token
+                ↓
+Routing:       Expert Bias在线更新（不再用aux loss干扰梯度）
+```
+
+**MoE的工程挑战：**
+- **All-to-All通信**：token分发和聚合需要跨GPU通信，成为瓶颈
+- **负载均衡**：需要专门的load balancing strategy，否则专家会两极分化
+- **Capacity Factor**：限制每个GPU接收的token数，溢出token需要丢弃或重复发送
+- **Expert Parallelism**：第4维并行方式，需要all-to-all NCCL通信
+
+**面试话术：**
+> "MoE的本质是'用稀疏换容量'——总参数量可以很大，但每次推理只激活一小部分。2026年的主流大模型基本都用MoE了（DeepSeek R1、Mixtral、Qwen3），面试必问。关键是说清楚三点：1）为什么总参≠激活参；2）如何保证负载均衡（aux loss或expert bias）；3）工程上all-to-all通信是最大瓶颈。能聊到DeepSeek-V3的fine-grained experts和shared experts，面试官会觉得你跟进得很深。"
 
 </details>
