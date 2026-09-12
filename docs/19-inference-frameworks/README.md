@@ -1419,4 +1419,307 @@ obj = pickle.loads(raw_data)  # RCE!
 
 ---
 
-*版本: v2.9 | 更新: 2026-05-12 | by 二狗子 🐕*
+### Q29: 什么是 KV Cache 分层卸载（Tiered KV Cache Offloading）？GPU/CPU/NVMe 各层怎么分工？
+
+<details>
+<summary>💡 答案要点</summary>
+
+**问题背景：**
+- 128K~1M token 上下文的长请求越来越多地进入生产环境
+- 单张 H100 (80GB) 上 BF16 KV Cache 约占用 40GB/用户，扣除模型权重后并发用户数只有 1~2
+- 仅靠 GPU 显存无法支撑实际业务规模
+
+**分层卸载架构（Hot-Warm-Cold 三态）：**
+```
+Layer    | Storage     | Content                    | 命中率预期
+---------|-------------|----------------------------|----------
+Hot      | GPU HBM     | 正在生成中的 KV Block       | ~95%+
+Warm     | CPU RAM     | 最近完成但多轮对话可能复用的 Prefix | ~30-50%
+Cold     | NVMe SSD    | 历史上下文 / 长期前缀缓存   | ~10-20%
+```
+
+**工作原理：**
+1. **热块保留 GPU** — 当前活跃请求的所有 KV Block 始终驻留 GPU
+2. **暖块推入 CPU** — 请求完成后若在多轮对话中可能被命中，则拷贝到 CPU DRAM
+3. **冷块写入 NVMe** — 长期不访问的前缀存入本地 SSD，通过内容寻址管理
+4. **按需回填** — 新请求携带匹配前缀时，从 Warm→GPU 或 Cold→Warm→GPU 两级回读
+
+**性能数据：**
+- 对于 128K+ 输入的多轮场景，NVIDIA 报告可带来 **up to 14× TTFT 缩短**
+- 吞吐方面：同一 GPU 上并发用户数可从 1~2 提升到 **10× 以上**
+- 代价：Warm→Cold 层级间存在带宽延迟；需要合理设定 eviction 策略
+
+**典型实现：**
+- vLLM 内置 OffloadingConnector + 第三方 LMCache/Mooncake
+- SGLang 通过插件方式对接 LMCache
+- 核心挑战是 KV tensor 的非连续内存布局与零拷贝传输
+
+**面试话术：**
+> "KV Cache 分层卸载的核心思想是'热点在 GPU，温点在 CPU，冷点进 NVMe'。我的经验是，只有在 GPU KV Cache 确实是瓶颈时才值得引入——对于短上下文单用户场景，额外 IO 只会增加延迟。落地时要关注多级回填的带宽开销、content-address 索引的效率，以及 eviction 策略不能影响多轮对话的正确性。"
+
+</details>
+
+---
+
+### Q30: LMCache 是什么架构？它如何在不修改 vLLM/SGLang 内核的前提下实现跨引擎 KV 缓存共享？
+
+<details>
+<summary>💡 答案要点</summary>
+
+**LMCache 定位：**
+- 一个 vendor-neutral 的 KV Cache 管理层（middleware），独立于推理引擎运行
+- 支持将 vLLM 和 SGLang 生成的 KV Cache 卸载到多种存储后端
+
+**核心架构设计：**
+```
+┌─────────────┐     ┌──────────────┐     ┌───────────────────┐
+│  vLLM Engine │     │  SGLang Eng. │     │  Next Request     │
+│  (Generator) │     │  (Generator) │     │                   │
+└──────┬──────┘     └──────┬───────┘     └────────┬──────────┘
+       │                   │                       │
+       │ KV blocks         │ KV blocks             │ prompt arrives
+       │ ↓ dump            │ ↓ dump                │ hash lookup
+       │                   │                       │
+       ▼                   ▼                       │
+  ┌───────────────────────────────────┐            │
+  │        LMCache Layer              │◄───────────┘
+  │  ┌─────────┐  ┌──────────────┐   │
+  │  │Content   │  │Multi-process │   │
+  │  │Addressed │  │Architecture │   │
+  │  │Index     │  │(MP mode)    │   │
+  │  └─────────┘  └──────────────┘   │
+  └──────────┬──────────────┬────────┘
+             │              │
+             ▼              ▼
+    ┌──────────────┐ ┌──────────────┐
+    │ CPU RAM      │ │ Remote:      │
+    │ Local Disk   │ │ Redis/Valkey │
+    │ NVMe SSD     │ │ Mooncake     │
+    │ S3 Object    │ │ InfiniStore  │
+    └──────────────┘ └──────────────┘
+```
+
+**关键技术亮点：**
+
+| 特性 | 说明 |
+|------|------|
+| **Content-addressed indexing** | KV 块按内容哈希而非位置标识，天然支持跨引擎复用 |
+| **Pluggable backends** | 同一接口对接 CPU RAM、SSD、Redis、Mooncake、InfiniStore、S3 等 |
+| **Multi-process (MP) Architecture (2026)** | 解决共享内存瓶颈：多进程并行读写，避免单个 GIL/锁竞争成为瓶颈 |
+| **Multi-node P2P (2026.01)** | 不同节点上的进程可通过 P2P 直连共享 CPU 内存，无需经过中心存储 |
+| **vLLM V1 turbo-boost** | 适配 vLLM V1 调度器，支持多模态模型的 KV offload |
+
+**与传统方案的差异：**
+- 相比直接 patch vLLM：不需要修改引擎内核代码，降低兼容性成本
+- 相比专用协议（如 Mooncake）：提供统一的抽象层，可在不同推理引擎间切换
+
+**局限性：**
+- 增加了额外的序列化/反序列化开销
+- 远端存储引入网络 RTT 延迟，需要 SLO-aware 的回填策略
+- MP 模式虽缓解 GIL 但增加进程间通信复杂度
+
+**面试话术：**
+> "LMCache 本质是在推理引擎外建了一层 KV 缓存管理中间件，通过内容寻址让跨引擎、跨节点的缓存复用变得可行。它的 pluggable 架构使得我们可以根据 SLO 选择最合适的后端——低延迟用 CPU RAM，大容量用 NVMe 或 Mooncake。关键设计在于 MP 架构解决了共享内存在高并发下的瓶颈，这在 2026 年的生产部署中已成为刚需。"
+
+</details>
+
+---
+
+### Q31: Mooncake Store 作为分布式 KV Cache 存储引擎，它与 LMCache 有什么区别？各自定位是什么？
+
+<details>
+<summary>💡 答案要点</summary>
+
+**Mooncake Store 定位：**
+- 专为 LLM 推理设计的**分布式 KV Cache 存储引擎**
+- 目标：以线速在网络间传输 KV Cache，支持预分解服务（PD Disaggregation）和高频跨实例缓存复用
+
+**核心架构特征：**
+
+| 维度 | LMCache | Mooncake Store |
+|------|---------|----------------|
+| **定位** | KV Cache 管理层（中层抽象） | KV Cache 存储引擎（底层基础） |
+| **传输协议** | 依赖 Redis/NIXL/GDS 等后端 | 原生 RDMA (InfiniBand/RoCE) |
+| **寻址方式** | Content-addressed + pluggable backend | Content-addressed + NIXL 统一抽象 |
+| **主要客户** | 通用推理引擎（vLLM, SGLang） | 大规模推理集群、PD Disaggregation |
+| **深度集成** | 较浅，通过 connector 挂载 | 与 llm-d/vLLM/SGLang 深度集成 |
+
+**Mooncake 的关键能力：**
+```
+[Node A]                              [Node B]
+┌──────────────┐          RDMA         ┌──────────────┐
+│ Prefill GPU  │ ─── KV blocks ──► │ Decode GPU     │
+└──────────────┘  via Mooncake       └──────────────┘
+       ▲                                        │
+       │ KV blocks stored/retrieved              │ Generated tokens
+       ▼                                        ▼
+┌──────────────────────────────┐      ┌────────────────┐
+│ Mooncake Store (distributed  │◄─────┤ Shared KV store │
+│ content-addressed cache)     │       └────────────────┘
+└──────────────────────────────┘
+```
+
+**与 vLLM 的集成方式：**
+- vLLM 通过 `OffloadingConnector` API 挂载 Mooncake
+- KV 块由 vLLM block hash 标识，映射为 Mooncake 的内容寻址对象
+- 传输走 RDMA 绕过 CPU，直接 GPU-to-GPU
+
+**何时选谁：**
+- 如果你的需求是「同节点/同机房的短期 KV 复用」→ LMCache + CPU RAM/SSD 足够
+- 如果你的需求是「跨节点、大带宽、低延迟的 PD Disaggregation」→ Mooncake 是更优选择
+- 两者也可组合：Mooncake 作远端存储后端，LMCache 做上层管理和淘汰策略
+
+**面试话术：**
+> "Mooncake 更像是一个专门为 KV Cache 打造的分布式存储层，追求的是 RDMA 级别的零拷贝线速传输，特别适合 PD Disaggregation 这种跨节点架构。而 LMCache 更像是上层的管理层，灵活选择存储后端。在实际部署中，如果要做大规模推理集群，这两者可以互补——LMCache 负责调度和淘汰，Mooncake 负责高速数据传输。"
+
+</details>
+
+---
+
+### Q32: Chunked Prefill 和 Layered Prefill（如 LAPS）有什么区别？各自的适用场景是什么？
+
+<details>
+<summary>💡 答案要点</summary>
+
+**Chunked Prefill（令牌级分片）：**
+- 把长 prompt 切分成若干个 token 块，每个 chunk 处理完后加入待解码队列
+- 在 ongoing decode 之间穿插 prefill chunk，防止长 prompt 独占 GPU
+- **优势**：调度简单、对 TBT（Time-Between-Token）友好、已在 vLLM 和 SGLang 中成熟部署
+- **劣势**：仍然在 token 粒度进行调度，MOE 模型每 chunk 可能需要重新加载专家权重
+
+**Layered Prefill（层分级片）/ LAPS（Length-Aware Prefill Serving）：**
+- 不再在 token 维度分片，而是在**层维度**组织预填充
+- 将请求按 prompt 长度分类，长 prompt 走 pipeline parallelism，短 prompt 直接预填充
+- **LAPS 效果（MLSys 2026）**：TTFT 降低 up to 70%，端到端延迟降 41%，每 token 能耗降 22%
+- 消除了 chunk-induced MoE weight reload，显著降低 off-chip bandwidth 需求
+
+**对比表：**
+
+| 维度 | Chunked Prefill | Layered Prefill (LAPS) |
+|------|-----------------|------------------------|
+| **分片粒度** | Token 级别 | Layer 级别 |
+| **MoE 权重重载** | 每个 chunk 都可能触发 | 消除 |
+| **TTFT 最优** | 中等改善 | 大幅降低 |
+| **实现复杂度** | 低（已在引擎中标准化） | 高（需新的调度器和编排） |
+| **最佳场景** | 一般多租户推理服务 | 多租户且 prompt 长度异构的场景 |
+
+**面试话术：**
+> "Chunked Prefill 是目前最主流的长 prompt 解决方案，它在 token 粒度拆分预填充以避免独占 GPU。但面对 MOE 模型，chunk 边界会导致频繁的专家权重重载。Layered Prefill 从 MLsys 2026 开始崭露头角——它在层维度而不是 token 维度调度，彻底消除了 chunk 引起的 MoE reload。不过目前工程复杂度还很高，短期内 Chunked Prefill 仍是工业界默认方案。"
+
+</details>
+
+---
+
+### Q33: Prefill-Decode Disaggregation（PD 分离）在什么情况下值得采用？有哪些已知风险？
+
+<details>
+<summary>💡 答案要点</summary>
+
+**PD 分离核心概念：**
+- 将**预填充阶段**（compute-heavy）和**解码阶段**（memory-bandwidth-bound）分配到不同的 GPU 实例上运行
+- Prefill 实例专门处理长 prompt，完成后将 KV Cache 传递给 Decode 实例继续生成
+
+**为什么值得：**
+1. **利用率最大化**：Prefill 和 Decode 的工作负载完全不同，分开部署可以让每类实例专门化
+2. **弹性伸缩**：可以根据实际流量分别扩缩 prefills 和 decodes
+3. **成本优化**：Prefill 实例可以选择高性价比的实例类型（不一定需要最大显存）
+
+**架构图示：**
+```
+[Request] ──► [Prefill GPU] ─── KV Cache ───► [Decode GPU] ───► Tokens stream out
+               (compute-heavy)   (transfers)      (mem-bw bound)
+```
+
+**已知风险和限制：**
+| 风险 | 描述 | 缓解措施 |
+|------|------|----------|
+| **KV 传输开销** | 128K 上下文的 KV Cache 可达数十 GB，网络传输消耗大量带宽 | 使用 RDMA/Mooncake 加速传输 |
+| **Decoded instance 空闲** | 若 decode 实例数量不足，请求会排队等待 decode 资源 | 设置合理的 queue 水位告警 |
+| **Prefill instance 饥饿** | 短请求在 prefills 实例上利用率极低 | 考虑 multiplexing 方案（如 MuxWise） |
+| **状态一致性** | 传输中断可能导致 KV cache 损坏 | 增加 checksum/完整性校验 |
+| **复杂度过高** | 运维多套实例组，增加了部署和监控负担 | 使用自动化 orchestration |
+
+**面试话术：**
+> "PD 分离适合高并发、长上下文的稳定流量场景。但在实际生产中我发现：第一，KV 传输的网络带宽往往是隐藏瓶颈——如果不做 RDMA 优化，反而比单体部署还慢；第二，短请求在 prefill 实例上利用率太低，需要考虑 multiplexing。所以我一般只在流量超过某个阈值后才引入 PD 分离，并且一定会配好 queue 监控和自动告警。"
+
+</details>
+
+---
+
+### Q34: MoE 模型在推理框架中面临哪些特有优化问题？Speculative Decoding 和 PD Separation 分别如何与 MoE 协作？
+
+<details>
+<summary>💡 答案要点</summary>
+
+**MoE 推理的特有问题：**
+
+| 问题 | 原因 | 影响 |
+|------|------|------|
+| **专家权重重载** | 每次 chunk 可能需要激活不同的专家子集 | 频繁 off-chip weight load，增大 off-chip bandwidth 压力 |
+| **负载均衡** | 训练好的专家路由可能在高并发下失衡 | 某些 GPU 过载而其他闲置 |
+| **显存占用更高** | 所有专家权重必须驻留在 GPU 上 | 可用显存减少，并发受限 |
+
+**与 Speculative Decoding 的交互：**
+- Draft model 本身可以是 MoE，也可以是 Dense
+- Dense draft + MoE target：draft 更快，验证阶段 MoE 只计算被路由到的专家，总体加速比可观
+- MoE draft + MoE target：两个都是 sparse，通信和激活的计算需要仔细调参
+
+**与 PD Separation 的交互：**
+- Prefill 阶段的 MoE weight reload 是主要瓶颈
+- LAPS（Layered Prefill）的研究表明，如果在层维度调度可以避免 chunk-induced MoE reload
+- Decode 阶段不受 MoE reload 影响（只需要已路由专家的 activations）
+
+**面试话术：**
+> "MoE 最大的痛点是 off-chip bandwidth——每个 chunk 都要重新加载专家权重。Speculative Decoding 在这种情况下其实是帮倒忙还是帮忙取决于你的 draft model 配置：如果 draft 是 dense 而 target 是 MoE，因为验证阶段 MoE 只算被激活的专家，所以加速效果不错。PD 分离的话要注意 prefill 阶段的 MoE reload，LAPS 这个方向在 2026 年很有前景。"
+
+</details>
+
+---
+
+### Q35: 推理框架如何处理超长上下文（1M+ tokens）场景？Ring Attention / Block-wise Attention 是什么思路？
+
+<details>
+<summary>💡 答案要点</summary>
+
+**1M+ 上下文的挑战：**
+- BF16 KV Cache 对于 1M tokens × 4096 dim ≈ 32GB 仅为 KV 部分，加上序列数为百GB级别
+- 标准 Attention O(n²) 复杂度对于 1M 输入根本不可行（10¹² 次乘法）
+- Memory bandwidth bound + compute wall 双重打击
+
+**Ring Attention（环形注意力）：**
+```
+原理示意：
+GPU0: [Part_A] --ring--> [Part_B] --ring--> [Part_C] --ring--> [Part_A]
+       ←--           ←--           ←--
+       
+将 self-attention 拆成多个步骤：
+Step1: GPU0(Part_A,Q) @ GPU1(Part_B,KV)
+Step2: GPU1(Part_B,Q) @ GPU2(Part_C,KV)  
+Step3: GPU2(Part_C,Q) @ GPU0(Part_A,KV)
+...通过 Ring AllReduce 累积全局 attention 结果
+```
+
+**Block-wise Attention：**
+- 类似 Ring Attention 但更细粒度
+- 将 KV 矩阵按块分割，逐块计算并累积 softmax 结果
+- 可以配合流水线并行和张量并行叠加使用
+
+**实际生产方案：**
+| 方案 | 适用场景 | 代表系统 |
+|------|---------|---------|
+| **FlashAttention-3** | 常规长上下文（≤64K） | Triton kernel |
+| **Ring Attention** | 分布式训练及推理 | Megatron-LM, ColossalAI |
+| **StreamingLLM** | 不需要完整 KV Cache 的场景 | ARXIV 方案，滑动窗口 |
+| **Chroma / Linformer 近似** | 精度要求可放宽的场景 | 投影压缩 |
+| **Hybrid: Ring + FlashAttn** | 超大上下文分布式推理 | vLLM 实验性支持 |
+
+**面试话术：**
+> "1M+ 上下文已经不能用传统的 O(n²) attention 了。Ring Attention 是当前最先进的方案之一，它将注意力计算拆解并通过环形 all-reduce 在分布式 GPU 间分摊。但在推理框架中，真正的挑战不仅是计算，还包括 KV Cache 的传输和管理——所以需要结合 LMCache/Mooncake 这样的 KV 管理层来做完整的解决方案。目前业界更多是在训练侧应用 Ring Attention，推理侧还在探索阶段。"
+
+</details>
+
+---
+
+---
+
+*版本: v2.10 | 更新: 2026-09-13 | by 二狗子 🐕*
