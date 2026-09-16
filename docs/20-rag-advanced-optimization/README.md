@@ -2747,4 +2747,344 @@ def agentic_rag_pipeline(question: str, max_retries: int = 2) -> str:
 
 ---
 
+## 十五、最新高频工程面试题（2026年新增）
+
+### Q30: Recursive Character Text Splitter 为什么是行业最佳默认分块策略？何时不该用它？
+
+> 🧠 **图解记忆：** 多级分隔符 = 先段落再句子再词；天然尊重语义边界，是无可争议的 best default。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**Recursive Character Text Splitter（递归字符分块）原理：**
+
+```python
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500,
+    chunk_overlap=50,
+    separators=["\n\n", "\n", " ", ""]
+)
+chunks = splitter.split_text(document)
+```
+
+**与固定长度分割对比：**
+
+| 维度 | 固定长度分割 | Recursive Character Splitter |
+|------|-------------|---------------------------|
+| **语义完整** | ❌ 可能在句中间截断 | ✅ 优先在段落/句子边界切 |
+| **适应性** | 硬编码长度 | 自动适应文档结构 |
+| **默认值** | 无 | ✅ 行业公认 best default |
+| **实现难度** | 简单 | 几乎相同 |
+
+**2026年面试趋势（必考题）：**
+这个题目现在高频出现——"你是用固定分块还是语义分块？" 标准回答应该是："先用 Recursive Character Splitter，这是 best default；有了 query logs 证明 chunk 质量影响检索后，再上语义分块。盲目追求高级分块是 resume-driven architecture。"
+
+**什么时候不用它？**
+- 结构化文档（表格/代码块）→ Document Aware Splitter 按标题/列表切
+- 混合主题文档 → Semantic Chunking 按主题边界切
+- 需要精确 token 计数 → CharacterTextSplitter + tiktoken 计数
+
+**面试话术：**
+> "Recursive Character Splitter 的核心思想是用多级分隔符递归拆分：先从段落切，不够细再从句子切，再不够就按空格切。它在尊重文档自然结构和保持语义完整性之间取得了最佳平衡。我的原则是：永远用它作为默认值，只有在你收集了真实的 query logs 并确认 chunk 质量影响检索效果之后，才考虑更复杂的方案。盲追求高级分块就是 resume-driven architecture。"
+
+</details>
+
+---
+
+### Q31: 如何设计企业级生产 RAG 系统？两大 Pipeline 为什么必须分离？
+
+> 🧠 **图解记忆：** 索引管线的使命是「全量可重复」，查询管线的使命是「低延迟保安全」；混在一起就是技术债的开始。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**两大 Pipeline 职责分工：**
+
+| 维度 | Indexing Pipeline（索引管线） | Query Pipeline（查询管线） |
+|------|-------------------------------|---------------------------|
+| **目标** | 规模、完整、可重复 | 低延迟、高相关、安全 |
+| **核心操作** | 解析、分块、增强、嵌入、存储 | 认证、检索、重排、生成、溯源 |
+| **触发方式** | 事件驱动（文件变更/定时） | 请求驱动（用户查询） |
+| **SLA** | 最终一致性即可 | P95 延迟 < 2s |
+| **失败后果** | 数据暂存（不影响用户） | 直接报错给用户 |
+
+**为什么不能合并：**
+
+```python
+# ❌ 错误做法：每次查询都重新解析所有文档！
+class BadRAG:
+    def answer(self, user_query):
+        self.parse_all_documents()
+        self.rechunk_all()
+        self.rerun_embeddings()
+        results = self.vector_search(user_query)
+        return self.generate(results)
+# 问题：每次查询都要重新索引百万文档，延迟巨大，索引失败还阻塞服务
+```
+
+```python
+# ✅ 正确做法：双管线分离
+class ProductionRAG:
+    def __init__(self, index_pipeline, query_pipeline):
+        self.index = index_pipeline   # 后台运行
+        self.query = query_pipeline   # 实时响应
+
+    def ingest_document(self, doc):
+        chunks = self.index.parse(doc)
+        embeddings = self.index.embed(chunks)
+        self.index.store(embeddings)
+
+    def answer(self, user, query):
+        self.query.authenticate(user)
+        docs = self.query.retrieve(query)
+        docs = self.query.rerank(docs)
+        context = self.query.build_context(docs)
+        return self.query.generate(user, query, context)
+```
+
+**生产环境关键考量：**
+1. **版本化文档管理**：每次索引打版本号，支持回滚
+2. **增量索引**：只处理变更的文档，不做全量重建
+3. **幂等性**：同一份文档多次入库应得到相同结果
+4. **独立扩展**：索引管线加机器不影响查询管线性能
+5. **权限集成**：查询管线在检索前做权限预过滤
+
+**面试话术：**
+> "我设计的 RAG 系统是两管线架构。索引管线负责解析、分块、嵌入、存储——它是一个后台任务，保证可重复性和完整性。查询管线负责用户认证、检索、重排、生成——它对延迟和安全负责。两者完全解耦可以独立扩展，索引管线失败不会阻塞用户查询。这是生产环境的标配架构，也是面试中展示工程化思维的关键点。"
+
+</details>
+
+---
+
+### Q32: 长上下文模型（百万 token）来了，RAG 会死吗？
+
+> 🧠 **图解记忆：** 长上下文解决的是「能不能装下」，RAG 解决的是「要不要传」「传多少最划算」。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**这不是替代题而是成本推理题。** 面试官真正想听的是你对两种方案的成本效益分析。
+
+**RAG vs 长上下文不是替代而是互补：**
+
+| 场景 | 纯长上下文 | RAG + 短上下文 |
+|------|-----------|---------------|
+| 知识库几万字 | ✅ 可行 | 也可以 |
+| 知识库几百GB | ❌ 不可能 | ✅ 只传 Top-K |
+| 推理成本 | 🔴 极高（百万 token 输入费用） | 🟢 可控 |
+| 响应延迟 | 🔴 高（生成也要遍历百万 token） | 🟢 低 |
+| 实时更新 | ❌ 需微调或替换模型权重 | ✅ 换文档即更新 |
+| 幻觉追溯 | ❌ 难以定位哪篇文献 | ✅ 精确到 chunk ID |
+
+**RAG 不可替代的三个原因：**
+
+1. **成本因素**：把 1TB 知识库全部塞进去的 token 成本和显存开销是天文数字。RAG 只传 Top-K relevant chunks，成本可控。
+2. **知识时效性**：今天发布的财报明天就要能回答——RAG 只需更新知识库不需要重新训练。
+3. **精确追溯**：医疗和法律场景必须追溯到具体出处，长上下文模型无法给出"来自哪一页"。
+
+**正确的分层策略（面试加分项）：**
+
+```text
+小型知识库（< 几十万 tokens）→ 直接用长上下文少检索
+中型知识库（几十万 ~ 千万 tokens）→ RAG + Rerank
+大规模知识库（千万 tokens+）→ RAG + GraphRAG + 多路召回
+```
+
+**面试话术：**
+> "这是一个陷阱题。长上下文确实让一些 RAG 简化了——不再需要复杂粗召回管道。但 RAG 永远不会死，因为根本问题没消失：知识库太大传不完、知识变化太快喂不进模型、法律医疗要求追溯出处。正确姿势是分层对待：小库可以直接用长上下文，大库 RAG 的按需检索+精准引用是不可替代的工程最优解。面试官问这道题就是在考成本意识，你要能从 token 成本、延迟和合规追溯三个维度给出权衡结论。"
+
+</details>
+
+---
+
+### Q33: RAG 系统中 Embedding Drift 是什么？如何检测和缓解？
+
+> 🧠 **图解记忆：** Embedding 空间变了→距离意义就变了→旧索引漂移；要定期比对、定期重建、持续监控。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**Embedding Drift 的定义：**
+
+```
+现象描述：随着时间推移，RAG 系统的检索质量逐渐下降，
+         不是因为检索算法错了，而是因为 embedding 模型或语料分布变了。
+
+典型触发条件：
+1. 更换了 Embedding 模型（从 v1 升级到 v2）
+2. 语料库大量更新，新文档风格与旧文档差异大
+3. 语言或领域迁移（中文转多语种、专业领域拓展）
+4. Embedding API 后端升级但未通知上层
+```
+
+**检测机制：**
+
+```python
+class EmbeddingDriftMonitor:
+    def __init__(self, vector_db, eval_set_path):
+        self.db = vector_db
+        self.eval_set = self.load_eval_set(eval_set_path)  # 稳定的黄金测试集
+
+    def detect_drift(self, window_days=7):
+        """每周检查一次 embedding drift"""
+        historical = self._evaluate_on_test_set("last_month")
+        current = self._evaluate_on_test_set("this_week")
+
+        precision_drop = current["precision"] - historical["precision"]
+        recall_drop = current["recall"] - historical["recall"]
+
+        if abs(precision_drop) > 0.05 or abs(recall_drop) > 0.05:
+            self.alert(f"Embedding drift: precision drop {precision_drop:.3f}")
+            return "drift_detected"
+        return "healthy"
+```
+
+**缓解策略：**
+
+| 策略 | 说明 | 成本 |
+|------|------|------|
+| **定期重索引** | 检测到 drift 后用新模型全量重建 | 中 |
+| **版本化管理** | 每个模型对应一个索引版本，不就地修改 | 低 |
+| **降级回滚** | 新模型失败时一键切换回旧索引 | 低 |
+| **增量更新** | 只重新嵌入变更的文档片段 | 低 |
+| **Dashboard** | 实时展示检索 F1 趋势线 | 低 |
+
+**最佳实践四步走：**
+1. **保留黄金测试集**：至少 100 条高质量 query-answer-reference 对
+2. **每周自动评估**：CI 管道中加入 RAG 回归测试
+3. **建立基线**：记录基线指标，设置 ±5% 告警阈值
+4. **不原地改索引**：新模型建新索引，蓝绿切换上线
+
+**面试话术：**
+> "Embedding drift 是最隐蔽的生产问题——悄无声息地降低检索质量而不触发任何明显错误。我的防御策略三步走：第一保留稳定黄金测试集每周自动跑评估；第二给每个模型版本维护独立索引绝不原地修改；第三精度或召回率下降超过 5% 立即触发重建预案。在金融客户项目中我们用这套方案避免了两次因 model 升级导致的检索崩塌事故。"
+
+</details>
+
+---
+
+### Q34: HNSW 和 IVF-PQ 有什么区别？如何选择向量搜索索引？
+
+> 🧠 **图解记忆：** HNSW 是分层导航图（多层小世界），搜得快准；IVF-PQ 是聚类+量化，建得快省内存。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**两种主流近似最近邻索引对比：**
+
+| 维度 | HNSW (Hierarchical Navigable Small World) | IVF-PQ (Inverted File + Product Quantization) |
+|------|--------------------------------------------|----------------------------------------------|
+| **结构** | 多层图结构，上层粗略下层精细 | K-means 聚类 + 乘积量化压缩 |
+| **建索引速度** | ⏱️ 较慢（O(n log n) 建图） | ⚡ 很快（K-means 聚类比快） |
+| **检索速度** | ⚡ 极快（层数决定搜索路径） | 🔄 中等（需解码 PQ vectors） |
+| **召回精度** | ✅ 高（top-k 召回率高） | △ 有损（PQ 量化损失精度） |
+| **内存占用** | 🔴 大（每个 vector 存多个邻居指针） | 🟢 小（PQ 压缩可达 64x） |
+| **适合场景** | 中小规模数据集、高准确度需求 | 大规模数据集、资源受限 |
+| **调参复杂度** | 中（efConstruction, M 参数） | 高（nlist, nprobe, m, subcode_sz） |
+
+**实际基准数据参考：**
+
+| 数据量 | 索引类型 | Recall@10 | P95延迟(ms) | 每vector内存 |
+|--------|---------|-----------|-------------|-------------|
+| 10万 | HNSW | 98.5% | 2.3 | ~50 |
+| 10万 | IVF-PQ | 94.2% | 1.8 | ~8 |
+| 100万 | HNSW | 97.8% | 15.6 | ~500 |
+| 100万 | IVF-PQ | 91.5% | 5.2 | ~64 |
+| 1000万 | IVF-PQ | 88.3% | 12.1 | ~512 |
+
+**选择决策树：**
+
+```
+数据量 < 50万 ?
+  ├── 是 → HNSW（精度高，延迟低，API 简单）
+  └── 否 → 预算有限？
+          ├── 是 → IVF-PQ（牺牲少量精度换性价比）
+          └── 否 → HNSW（追求极致精度）
+
+需要在线增量插入？
+  ├── 是 → HNSW（原生支持增量建图）
+  └── 否 → 根据上面判断选
+```
+
+**面试话术：**
+> "HNSW 和 IVF-PQ 的选择本质上是在精度、速度和内存之间做权衡。100万以下的数据量 HNSW 是毫无疑问的首选——召回率高、延迟低、API 简单。超过百万量级时如果内存预算紧张，IVF-PQ 能用 PQ 量化把内存压到 HNSW 的十分之一，但精度会损失几个百分点。我做过一个 200万文档的项目，开始用 HNSW 占满 64GB 内存，换成 IVF-PQ 后内存降到 8GB，召回只掉了 2 个百分点。"
+
+</details>
+
+---
+
+### Q35: 如何处理 RAG 中的模糊或多义用户查询？
+
+> 🧠 **图解记忆：** 模糊不是噪声，是多意图的信号——先澄清再查，查不到就诚实说不知道。
+
+<details>
+<summary>💡 答案要点</summary>
+
+**模糊查询分类和处理策略：**
+
+| 类型 | 例子 | 处理方式 |
+|------|------|----------|
+| **指代不明** | "这个产品怎么样？" | 结合对话历史消歧 |
+| **范围过大** | "AI 是什么？" | 缩小范围或提供概览 |
+| **术语歧义** | "帮我分析 transformer" | NLP 模型 vs 电力变压器 |
+| **缺少约束** | "给我推荐一部电影" | 询问偏好类型 |
+| **矛盾指令** | "写一个简单复杂的程序" | 请用户澄清 |
+
+**消歧流程设计：**
+
+```python
+def handle_ambiguous_query(query, history=None):
+    """
+    第一步：检测模糊度
+    第二步：尝试消歧（history + keyphrase disambiguator）
+    第三步：仍不确定则主动反问而非猜测
+    """
+    ambiguity = detect_ambiguity(query)  # LLM 打分 0-1
+
+    if ambiguity > 0.7:
+        # 高度模糊 → 直接提问澄清
+        options = generate_clarification_options(query)  # 2-3个可能解读
+        return f"这个问题可能有多种理解：{options} 您想要哪个？"
+
+    if ambiguity > 0.3 and history:
+        # 中度模糊 → 结合历史消歧
+        resolved = resolve_from_history(query, history)
+        return normal_retrieve(resolved)
+
+    # 清晰查询 → 正常处理
+    return normal_retrieve(query)
+```
+
+**关键设计原则（面试展示深度）：**
+
+1. **不要猜**：模糊查询比查不到更危险——基于错误假设给出的答案看似合理但完全不对
+2. **给选项**：必须回应时列 2-3 个可能解读让用户选
+3. **利用上下文**：多轮对话中前面的话题是消歧最佳线索
+4. **诚实比聪明重要**："您能补充一下 X 吗？" 比瞎猜好得多
+
+**生产实战模式——多路假设检索：**
+
+```python
+def multi_hypothesis_retrieve(query):
+    """为模糊查询生成多个可能的解读，各自检索后呈现选项"""
+    interpretations = llm.generate_interpretations(query)
+    # 例如 "分析transformer" → ["NLP Transformer注意力机制", "变压器电气分析"]
+
+    results = []
+    for interp in interpretations:
+        docs = vector_store.search(interp, k=5)
+        results.append((interp, docs))
+
+    # 呈现给用户提供点击方向
+    return present_options_with_previews(results)
+```
+
+**面试话术：**
+> "处理模糊查询的原则是'宁可不答不要误答'。我的流程三步：第一步检测模糊度——指代不清、范围过大的标记为模糊；第二步尝试消歧——结合对话历史和关键词消歧器；第三步仍不确定主动反问澄清而非猜测。生产系统中我还加了 fallback：多路解释检索出来的结果差异很大时告诉用户'这个问题有多种理解，您要 A 还是 B？'。这种设计显著降低了误导用户的风险。"
+
+</details>
+
+---
+
 *内容治理：2026-08-12 | 将重复考点合并到主答案，保留 Q26-Q29 四道生产追问题*
