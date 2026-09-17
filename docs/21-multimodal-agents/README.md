@@ -19,6 +19,11 @@
 9. [Qwen3-VL 架构案例](#九qwen3-vl-架构案例)
 10. [GUI Agent 与 Computer Use](#十gui-agent-与-computer-use)
 11. [GUI Agent 数据与自适应执行](#十一gui-agent-数据与自适应执行)
+12. [视觉幻觉与可信度](#十二视觉幻觉与可信度)
+13. [图像生成与编辑 Agent](#十三图像生成与编辑-agent)
+14. [空间定位与几何理解](#十四空间定位与几何理解)
+15. [音频/VLA 整合](#十五音频vla-整合)
+16. [多模态评测基准与评估](#十六多模态评测基准与评估)
 
 ---
 
@@ -1449,3 +1454,647 @@ OS-Kairos 的重要启发是把 `ASK_USER` 作为可学习的交互决策：Agen
 - [《动手学大模型》GUI Agent 实验与课件索引](../references/dive-into-llms-reading-list.md#9-gui-agent-构建高优先级)
 
 </details>
+
+## 十二、视觉幻觉与可信度
+
+### Q17: 多模态模型最常见的视觉幻觉（Hallucination）有哪些？怎么检测和缓解？
+
+
+<p align="center">
+  <a href="../../assets/illustrations/21-multimodal-agents/q17-vision-hallucination.webp">
+    <img src="../../assets/illustrations/21-multimodal-agents/q17-vision-hallucination.webp" width="760" alt="21 模块 Q17 教学图：多模态模型的常见视觉幻觉类型及检测缓解方法">
+  </a>
+</p>
+<p align="center"><sub>🧠 图解记忆：VLM 幻觉分五大类——凭空捏造文字、混淆对象位置、编造空间关系、丢失背景信息、违反物理常识；图片可查看原图。</sub></p>
+<details>
+<summary>💡 答案要点</summary>
+
+**VLM 幻觉的五种核心分类（VIGIL 基准定义）：**
+
+| 类型 | 表现 | 示例 |
+|------|------|------|
+| **Object Visual Fidelity** | 把不存在的物体说成存在，或改变现有物体的属性 | "图中有红色汽车" → 实际是蓝色 |
+| **Background Fidelity** | 忽略/篡改画面中的背景细节 | "桌上有一盆绿植" → 实际上没有 |
+| **Spatial Fidelity** | 搞错元素之间的相对位置 | "左边的人是老师" → 实际在右边 |
+| **Instructional Fidelity** | 忽视 prompt 中给定的约束条件 | 让回答三个问题却只答了两个 |
+| **Physical Integration Fidelity** | 生成违反物理规律的描述 | "杯子悬浮在空中往桌子里倒水" |
+
+**最典型的高频幻觉场景：**
+
+```
+1. Confabulating Text（捏造文字）:
+   VLM 看到模糊的交通标志 → 自信地"读出"一个名字
+   （基于训练数据中的文本先验覆盖了对图像的理解）
+
+2. Object Hallucination（经典幻觉）:
+   问"图中有几只手" → VLM 数出 4 只（实际只有 3 只+袖子褶皱）
+
+3. Temporal Hallucination（时序幻觉）:
+   视频中某人第 5 秒出现，VLM 说从开头就在
+```
+
+**检测方法：**
+
+<details>
+<summary>展开 Python 代码示例（38 行）</summary>
+
+```python
+# 方法1：交叉验证（多视角一致性）
+def cross_check_vlm(image, prompt):
+    # 用不同模型/不同参数多次回答，检查一致性
+    answers = [
+        gpt4v.analyze(image, temperature=0.1),
+        claude_v.analyze(image, temperature=0.1),
+        qwen_vl.analyze(image, temperature=0.1),
+    ]
+    # 统计每个事实陈述的出现次数
+    facts = extract_facts(answers)
+    confidence_scores = {fact: count / len(answers) for fact, count in facts.items()}
+    return confidence_scores
+
+# 方法2：Chain-of-Visual-Thought（CoVT）
+def cvt_answer(image, prompt):
+    # 要求模型先描述再回答，降低直接结论的幻觉率
+    description = gpt4v.describe_image(image)  # Step 1: 客观描述
+    answer = gpt4v.reason(description + f"\n\n{prompt}")  # Step 2: 基于描述推理
+    return answer
+
+# 方法3：OCR 辅助验证（针对含文字场景）
+def validate_with_ocr(image, vlm_answer):
+    ocr_text = pytesseract.image_to_string(image)
+    # 提取 VLM 提到的所有关键词
+    claimed_words = extract_keywords(vlm_answer)
+    actual_words = set(ocr_text.split())
+    false_claims = claimed_words - actual_words
+    if false_claims:
+        return {"hallucinated_words": list(false_claims)}
+    return {"valid": True}
+```
+
+</details>
+
+**缓解策略对比（面试重点）：**
+
+| 策略 | 原理 | 效果 | 成本 |
+|------|------|------|------|
+| **高对比度采样** | 用 T=0 或多角度采样取一致结果 | 中等 ⭐⭐⭐ | 低 |
+| **CoVT 思维链** | 先生成描述再生成结论 | 减少 30%+ 幻觉 | 中（多一次调用） |
+| **OCR 辅助验证** | 文字类事实交给 OCR | 文字幻觉几乎归零 ⭐⭐⭐⭐ | 低 |
+| **双模交叉验证** | GPT-4o + Claude 互相比对 | 召回缺失 大幅减少 | 高 |
+| **后处理规则** | 对数字/实体做硬校验 | 精确匹配项 100% 拦截 | 低 |
+| **微调去幻觉** | 用标注过的去幻觉数据 fine-tune | 基线提升但泛化有限 | 高 |
+
+**企业级生产实践建议：**
+
+1. **高风险场景必须加引用溯源** —— 每句话标注来自图像的哪部分
+2. **结构化输出强制字段校验** —— JSON Schema 限制可能出现的值域
+3. **关键决策走多人投票** —— 同一张图三个 VLM 都认可才采信
+
+**面试话术：**
+> "VLM 幻觉比纯文本 LLM 更危险——用户会相信模型'看到的'。我的经验是幻觉分五类，最严重的是 Object Fidelity 和 Spatial Fidelity。生产环境里我用 CoVT（先描述后推理）+ OCR 辅助做双重保障，关键业务还要多模型交叉验证。记住一句口诀：'VLM 说的不等于看到的，需要被验证才能采信。'"
+
+</details>
+
+---
+
+### Q18: 什么是 Chain-of-Vision-Thought（CoVT）？为什么它对 VLM 如此重要？
+
+
+<p align="center">
+  <a href="../../assets/illustrations/21-multimodal-agents/q18-covt.webp">
+    <img src="../../assets/illustrations/21-multimodal-agents/q18-covt.webp" width="760" alt="21 模块 Q18 教学图：CoVT 让 VLM 先生成视觉描述再推理回答，拆解复杂任务并减少幻觉">
+  </a>
+</p>
+<p align="center"><sub>🧠 图解记忆：先看清楚再说清楚——CoVT 分两步：客观描述→逻辑推理；点击图片可查看原图。</sub></p>
+<details>
+<summary>💡 答案要点</summary>
+
+**CoVT = Chain-of-Vision-Thought，是 CoT 在视觉领域的自然扩展。**
+
+传统 VLM 做法：`图像 → LLM 直接输出结论`
+CoVT 做法：`图像 → ①客观视觉描述 → ②基于描述推理 → ③结论`
+
+**为什么 VLM 特别需要 CoVT？**
+
+| 原因 | 说明 |
+|------|------|
+| **视觉→语言的语义鸿沟更大** | 文本到文本的映射相对线性，图像信息是连续的、多维的，直接跳到结论容易丢细节 |
+| **幻觉率高** | VLM 的直接回答更容易编造不存在的元素 |
+| **复杂任务需要中间推理** | 比较两张图、做数学题等任务无法一步到位 |
+
+**CoVT vs Direct 对比实验数据（2025-2026 多项研究共识）：**
+
+| 指标 | Direct（直接回答） | CoVT（先描述后推理） | 提升 |
+|------|-------------------|---------------------|------|
+| 准确率 | 基线 | +10~15% | 📈 |
+| 幻觉率 | 基线 | -30~40% | 📉 |
+| Token 消耗 | 低 | 增加约 2x（但质量更高） | ⚖️ |
+| 延迟 | 短 | 长（多一轮生成） | ⚠️ |
+
+**实现方式：**
+
+```python
+# Prompt 工程版 CoVT（不用额外 API，靠 Prompt 控制）
+covt_prompt = """
+请分析这张图片并按以下步骤回答：
+
+Step 1 - 视觉描述：
+客观列出图中可见的元素（不推断意图）
+
+Step 2 - 逻辑推理：
+基于以上观察，回答原始问题
+
+Step 3 - 最终答案：
+一句话总结
+
+图片内容如下：[{image}]
+原始问题：{question}
+"""
+
+response = multimodal_llm.generate(covt_prompt)
+```
+
+**进阶：结构化 CoVT（适合 Agent 自动化）**
+
+```json
+{
+  "step1_visual_description": ["桌子", "三本书", "一杯咖啡", "窗台阳光"],
+  "step2_reasoning": "从物品摆放看这是工作区域，咖啡暗示人在使用...",
+  "step3_conclusion": "这是一个有人正在使用的书房/工作台场景"
+}
+```
+
+**什么时候该用 CoVT？**
+
+| 场景 | 是否推荐 | 理由 |
+|------|---------|------|
+| 简单描述（"这是什么颜色？"） | ❌ 不必要 | Direct 已足够准确 |
+| 计数/定位（"图中有几辆车？"） | ✅ 推荐 | 避免幻觉遗漏 |
+| 比较推理（"A图和B图哪个更暗？"） | ✅ 强烈推荐 | 需要中间推理步骤 |
+| 数学/图表（柱状图解读） | ✅ 必须 | 第一步描述+第二步读取+第三步计算 |
+| 医疗/法律等高风险场景 | ✅ 必须有 | 可追溯的推理链是合规要求 |
+
+**面试话术：**
+> "CoVT 的本质是'分解问题降低复杂度'——VLM 直接从像素跳到文本的跨度太大，中间加一层视觉描述作为脚手架。我项目的经验是：简单场景用 Direct 省成本，涉及判断和推理的场景一律用 CoVT，虽然多一倍的 token 消耗但幻觉下降三成以上。高风险场景还可以加上结构化输出，每步都有迹可循。"
+
+</details>
+
+---
+
+## 十三、图像生成与编辑 Agent
+
+### Q19: Image Editing Agent 和 Text-to-Image Agent 有什么区别？核心技术路线是什么？
+
+
+<p align="center">
+  <a href="../../assets/illustrations/21-multimodal-agents/q19-image-editing-agent.webp">
+    <img src="../../assets/illustrations/21-multimodal-agents/q19-image-editing-agent.webp" width="760" alt="21 模块 Q19 教学图：Image Editing Agent 的核心技术路线——Reference、Inpainting、Diffusion Transformer 对比及应用场景">
+  </a>
+</p>
+<p align="center"><sub>🧠 图解记忆：Text2Image 是空创作，EditAgent 是有参照修改；点击图片可查看原图。</sub></p>
+<details>
+<summary>💡 答案要点</summary>
+
+**两种 Agent 的根本区别：**
+
+| 维度 | Text-to-Image Agent | Image Editing Agent |
+|------|--------------------|---------------------|
+| **输入** | 纯文本 Prompt | 参考图 + 编辑指令（文本/框/点） |
+| **起点** | 纯噪声 | 已有图像 |
+| **挑战** | Prompt 理解和创意表达 | 局部修改保真 + 全局一致 |
+| **典型应用** | AI 插画、概念设计 | 商品图修改、修图、Logo 替换 |
+
+**Image Editing Agent 的三大技术路线：**
+
+**路线 1：基于 Diffusion 的 Inpainting**
+```
+原始图 → 添加噪声 → Inpainting Mask 引导重绘 → 输出修改图
+优点：效果好，质量高
+缺点：速度较慢（需多步扩散），编辑范围有限
+代表：Stable Diffusion Inpainting、Flux Inpainting
+```
+
+**路线 2：Reference-based Generation（参考生成）**
+```
+参考图 A + 编辑指令 → 保留 A 的结构/布局 + 按需修改 → 输出
+优点：结构保持极好，支持多图参考
+缺点：指令跟随能力受限于架构
+代表：Kolors-IPAdapter、IP-Adapter、InstantID
+```
+
+**路线 3：Native Edit Models（原生编辑模型）**
+```
+输入: (参考图, 编辑指令, Mask) → Diffusion Transformer 端到端编辑
+优点：统一接口，支持多种编辑操作
+缺点：训练成本高，模型大
+代表：FLUX.1-dev edit, Dittex
+```
+
+**Image Editing Agent 工具集设计：**
+
+<details>
+<summary>展开 Python 伪代码（30 行）</summary>
+
+```python
+class ImageEditingAgent:
+    def __init__(self):
+        self.edit_model = load_edit_model()  # FLUX / SDXL-Inpaint
+        self.segmenter = load_segmentation_model()  # SAM2
+        self.llm = vision_llm  # 理解用户的自然语言编辑需求
+    
+    def process(self, image_url, edit_request):
+        # Step 1: LLM 理解编辑意图
+        intent = self.llm.parse({
+            "role": "user",
+            "content": f"编辑指令: {edit_request}"
+        })
+        
+        # Step 2: 自动分割目标区域（如果用户没提供 mask）
+        if "mask" not in intent:
+            segments = self.segmenter.detect(image_url, intent.target_object)
+            
+        # Step 3: 构建编辑 prompt（LLM 增强）
+        enhanced_prompt = self.llm.enhance(
+            base=intent.prompt,
+            style=intent.style_preference,
+            constraints=intent.constraints
+        )
+        
+        # Step 4: 执行编辑
+        result = self.edit_model.edit(
+            source=image_url,
+            prompt=enhanced_prompt,
+            mask=segments.get("mask"),
+            guidance_scale=intent.confidence * 7.5
+        )
+        
+        return result
+```
+
+</details>
+
+**面试高频追问：**
+
+- **为什么不用 Direct Inference 做编辑而要用专门的编辑模型？** → 因为直接在完整图像上 diff 会破坏不需要改的部分
+- **SAM + Diffusion 组合的效果好还是端到端更好？** → SAM 灵活但精度依赖分割质量；端到端更流畅但不够可控
+- **编辑 Agent 如何评估质量？** → 需要同时看局部修改准确度（LPIPS/FID-N）和全局一致性（CLIP score、人类偏好）
+
+**面试话术：**
+> "Image Editing Agent 的核心是把用户的自然语言编辑需求翻译成模型能理解的参数。我常用的 pipeline 是 LLM 解析意图 → SAM 自动切 mask → Diffusion inpainting 执行修改。选模型时看场景：电商换背景用 IP-Adapter 风格迁移最快，精准修图用 SDXL Inpainting，统一流程用 FLUX edit 原生模型。"
+
+</details>
+
+---
+
+### Q20: GenAI + Agent 的结合模式（如 GenClaw）是什么？与传统的 RAG 方案有何本质差异？
+
+
+<p align="center">
+  <a href="../../assets/illustrations/21-multimodal-agents/q20-genclaw-vs-rag.webp">
+    <img src="../../assets/illustrations/21-multimodal-agents/q20-genclaw-vs-rag.webp" width="760" alt="21 模块 Q20 教学图：GenClaw 代码驱动的 Agent 生成范式与传统检索增强生成的本质差异">
+  </a>
+</p>
+<p align="center"><sub>🧠 图解记忆：RAG 是检索现有知识，GenClaw 是用 Agent 自主创建新内容；点击图片可查看原图。</sub></p>
+<details>
+<summary>💡 答案要点</summary>
+
+**GenClaw 等 GenAI Agent 框架的核心思想：不是"找已有的东西"，而是"用代码指挥 Agent 创造新的东西"。**
+
+| 维度 | 传统 RAG | GenClaw / GenAI Agent |
+|------|---------|----------------------|
+| **数据流向** | 知识库 → 向量检索 → LLM 综合回答 | LLM 意图识别 → 生成代码/脚本 → 执行生成 |
+| **产出物** | 文本回复 | 图像、视频、音频、3D模型等新模态资产 |
+| **迭代机制** | 更新知识库重新索引 | Agent 反复调优 Prompt/参数直到满意 |
+| **确定性** | 相对稳定 | 需要人工 review 或自动评分循环 |
+| **典型管线** | Embedding + VectorDB | LLM-as-Coder + Diffusion/Generation Model |
+
+**GenClaw 的核心工作流：**
+
+```
+用户意图: "生成一张产品宣传图，白底，主角穿红色连衣裙"
+         ↓
+LLM Agent 分析意图:
+  - 产品类型 → 服装
+  - 主体描述 → 红裙女性
+  - 背景 → 白色
+  ↓
+生成 Python 脚本调用图像生成 API:
+  prompt="woman wearing red dress, white background, professional photography"
+  negative_prompt="text, watermark, blurry"
+  steps=50, cfg=7.5
+  ↓
+Agent 检查输出质量:
+  - 若不满意 → 调整参数重试（最多 N 次）
+  - 若满意 → 返回给用户
+  ↓
+用户反馈: "裙子换成蓝色"
+Agent 重新执行（增量修改）
+```
+
+**与传统 RAG 的本质差异：**
+
+1. **RAG 是"查找型"系统** —— 回答取决于已有知识库；GenClaw 是"创造型"系统 —— 产出不存在于任何文档
+2. **RAG 的瓶颈在检索质量**；GenClaw 的瓶颈在 Agent 的意图理解和迭代能力
+3. **RAG 可以离线预建**；GenClaw 通常需要在线生成且可能需要多轮试错
+4. **RAG 的输出格式固定**；GenClaw 的生成过程需要灵活的参数控制和条件判断
+
+**Agent 驱动生成 vs 手动调参对比：**
+
+| 环节 | 手动方式 | Agent 自动化方式 |
+|------|---------|-----------------|
+| Prompt 编写 | 人工逐字写 | LLM 根据意图自动生成+优化 |
+| 参数选择 | 凭经验设 | Agent 根据前次结果自动调参 |
+| 质量评估 | 人眼检查 | Agent + Vision Model 自动打分 |
+| 失败处理 | 重新来过 | Agent 自动 retry 或回退策略 |
+
+**面试话术：**
+> "GenClaw 代表了 GenAI + Agent 的新范式——不再只是检索和生成文本，而是用 Agent 来 orchestrating 整个创作过程。和 RAG 的本质差异在于：RAG 解决'找不到的信息'，GenClaw 解决'不存在的内容'。RAG 拼凑已有碎片，GenClaw 从零创造新东西。两者结合就是最强的系统：检索补充知识 + Agent 生成内容。"
+
+</details>
+
+---
+
+## 十四、空间定位与几何理解
+
+### Q21: 什么是 Spatial Grounding（空间定位/接地）？为什么它是 VLM 最难的能力之一？
+
+
+<p align="center">
+  <a href="../../assets/illustrations/21-multimodal-agents/q21-spatial-grounding.webp">
+    <img src="../../assets/illustrations/21-multimodal-agents/q21-spatial-grounding.webp" width="760" alt="21 模块 Q21 教学图：VLM 的空间定位能力——将自然语言提及的对象映射到图像中的确切位置">
+  </a>
+</p>
+<p align="center"><sub>🧠 图解记忆：空间定位 = 你说什么我能指到哪——VLM 最难的闭环能力；点击图片可查看原图。</sub></p>
+<details>
+<summary>💡 答案要点</summary>
+
+**Spatial Grounding = 将自然语言中提到的对象/属性精确映射到图像中的具体位置（坐标、边界框）。**
+
+**通俗理解：**
+- "图中那只戴帽子的狗在哪？" → VLM 不仅要说"左上角"，还要能画出准确的边界框
+- "把右边的花换成玫瑰" → 要精确定位"右边的花"在哪里
+
+**为什么它是最难的能力？**
+
+| 挑战 | 原因 |
+|------|------|
+| **细粒度对齐** | 文本中的"左边的花瓶"和图像中的视觉区域需要像素级的对应关系 |
+| **多义性消解** | "它"、"那个"等代词需要上下文推理才能定位 |
+| **遮挡处理** | 对象可能被遮挡但仍需正确定位其存在 |
+| **相似对象区分** | 图中有多只猫时，"最大的那只"需要尺寸比较能力 |
+| **跨模态语义鸿沟** | 语言描述的抽象程度 vs 视觉数据的精确程度之间存在巨大差距 |
+
+**主流 Spatial Grounding 方法对比：**
+
+<details>
+<summary>展开技术方案对比（25 行）</summary>
+
+```
+方法                        原理                  优势              劣势
+─────────────────────────────────────────────────────────────
+Box-detection head       在 VLM 旁加检测头     精度较高           需 bbox 标注
+Referring Expression     给定一句话找区域       直观               单目标为主
+Multi-reference          一句话对应多个区域     实用性强           需要 NMS 后处理
+Grounded Captioning      边描述边标注           信息丰富           耗时较长
+Gaussian Position       用高斯分布编码位置     支持软定位         计算开销大
+
+代表模型: CLIP+, SEEM, GLIDE-Grounding, Qwen2.5-VL-Grounded
+```
+
+</details>
+
+**面试加分点：**
+
+- **Qwen2.5-VL 等新一代 VLM 内置了 grounding 能力**——可以直接在对话中说"框出图中的猫"并返回 bbox
+- **多模态 agent 场景下，grounding 是 GUI Agent 和机器人控制的必要前置能力**——不知道点击哪里就无法操控
+- **评估指标**：G-Refer 基准用 Precision@k 衡量定位准确性（Top-1 bbox 的 IoU）
+
+**面试话术：**
+> "Spatial Grounding 是 VLM 从'看图说话'进化到'看图做事'的关键桥梁。我现在能做'看图回答问题'，但要让我'看图操控电脑/机器人'，必须先解决空间定位——知道对象在哪才能操作它。Qwen2.5-VL 已经内置了 grounding 能力，能在对话中直接画框定位，这对于 GUI Agent 和机器人导航来说是刚需。"
+
+</details>
+
+---
+
+## 十五、音频与 VLA 整合
+
+### Q22: Voice/音频模态如何与 VLM 整合形成真正的多模态 Agent？VLA（Vision-Language-Action）又是什么？
+
+
+<p align="center">
+  <a href="../../assets/illustrations/21-multimodal-agents/q22-audio-vla.webp">
+    <img src="../../assets/illustrations/21-multimodal-agents/q22-audio-vla.webp" width="760" alt="21 模块 Q22 教学图：音频模态整合架构与 VLA 模型——视觉语言到动作的统一模型">
+  </a>
+</p>
+<p align="center"><sub>🧠 图解记忆：语音是交互接口，视觉是感知通道，行动是输出终端；VLA 三者合一；点击图片可查看原图。</sub></p>
+<details>
+<summary>💡 答案要点</summary>
+
+**完整的五模态世界（2026 年愿景）：**
+
+| 模态 | 角色 | 代表模型 | 在 Agent 中的作用 |
+|------|------|---------|------------------|
+| 👆 **视觉(Vision)** | 眼睛 | GPT-4o/VLM | 看懂世界 |
+| 🎤 **语音(Audio/ASR)** | 耳朵 | Whisper/ElevenLabs | 听懂指令 |
+| 🔊 **语音(TTS)** | 嘴巴 | ElevenLabs/Cartesia | 说出回应 |
+| 💭 **语言(Language)** | 大脑 | GPT/Qwen/LLaMA | 理解推理决策 |
+| 🖐️ **动作(Action)** | 手脚 | VLA/Robot Control | 执行操作 |
+
+**Voice + VLM 整合架构（实时语音 Agent）：**
+
+```
+[用户说话] → ASR转文本 → VLM理解意图+看截图 → 决策引擎
+                                                         ↓
+                                          ┌──→ 回复文本 → TTS → [用户听到]
+                                   决策分支──→ 动作执行 → 环境反馈
+                                   决策分支──→ 反问澄清 → TTS
+```
+
+**关键技术难点：**
+
+| 难点 | 说明 |
+|------|------|
+| **端到端延迟** | ASR + VLM + TTS 全链路 < 1s 才是好的语音体验 |
+| **打断处理（Barge-in）** | 用户说话中途打断时正确处理当前回复 |
+| **情绪传达** | TTS 不仅要说话还要传递情绪（语气、停顿） |
+| **环境音处理** | 嘈杂环境中可靠地分离目标人声 |
+| **多模态融合** | 语音指令 + 当前画面 = 真正自然的交互 |
+
+**VLA（Vision-Language-Action）详解：**
+
+VLA = 将视觉(L)、语言(L)和动作(A)统一在一个模型中的架构。
+
+```
+传统方案:  VLM 输出文字 → 规则引擎/RL 转动作
+VLA方案:   VLM 直接输出动作token (如 click, swipe, pick)
+
+好处:
+- 端到端训练: 不需要中间的翻译层
+- 动作空间受限: 输出被限定在合法动作集合内
+- 实时性: 省去了一层层转换的延迟
+```
+
+**VLA vs 传统 VLM + Planner 对比：**
+
+| 维度 | VLM + Planner | VLA (端到端) |
+|------|--------------|-------------|
+| **架构** | 两个独立组件 | 单一模型 |
+| **训练** | VLM 训练 + RL/模仿学习规划 | 联合训练 (模仿学习为主) |
+| **灵活性** | Planner 可自定义 | 动作空间受训练数据限制 |
+| **实时性** | 两步产生额外延迟 | 一步到位，更快 |
+| **泛化性** | Planner 可泛化到新动作 | 未见动作需要重新训练 |
+
+**VLA 代表模型（2025-2026）：**
+
+| 模型 | 特点 | 适用场景 |
+|------|------|---------|
+| **RT-2** | Google DeepMind | 机器人抓取/操作 |
+| **PaLI-3 XGen-Code** | Google | 视觉编程 |
+| **Qwen2.5-VL + ROS** | 阿里 | 国产 VLA 方案 |
+| **Octo** | Open-source | 通用机器人控制 |
+
+**面试话术：**
+> "VLA 代表了'多模态 Agent 的最后一步'——不只是理解（视觉+语言），还能行动。传统方案是 VLM 输出文字再由规划器转动作，VLA 直接端到端输出动作 token。我在考虑语音 Agent 的架构时，会先用 ASR 转文本，VLM 理解意图并分析当前画面，最后用 TTS 回复。关键是整条链路的延迟要控制在 1 秒以内，否则体验就像在对空气说话。"
+
+</details>
+
+---
+
+## 十六、多模态评测基准与评估
+
+### Q23: 如何评估多模态 Agent 的质量？有哪些主流评测基准？
+
+
+<p align="center">
+  <a href="../../assets/illustrations/21-multimodal-agents/q23-multimodal-benchmarks.webp">
+    <img src="../../assets/illustrations/21-multimodal-agents/q23-multimodal-benchmarks.webp" width="760" alt="21 模块 Q23 教学图：多模态 Agent 的评测体系——感知、推理、交互、安全四个维度的评测矩阵">
+  </a>
+</p>
+<p align="center"><sub>🧠 图解记忆：评测要分四层——感知对不对、推理合不合理、操作干不干净、安全有没有底线；点击图片可查看原图。</sub></p>
+<details>
+<summary>💡 答案要点</summary>
+
+**多模态评测的分层框架（面试重点）：**
+
+```
+多模态 Agent 评测金字塔
+├── Level 1: 基础感知（Perception）
+│   ├── OCR 准确率
+│   ├── 物体检测 mAP
+│   ├── 图像描述 BLEU/ROUGE
+│   └── 视频事件检测
+├── Level 2: 视觉推理（Reasoning）
+│   ├── MMMU（多学科图文推理）
+│   ├── MathVista（数学+图表）
+│   ├── ChartQA（图表问答）
+│   └── ScienceQA（科学推理）
+├── Level 3: 交互能力（Interaction）
+│   ├── OSWorld（GUI 自动化）
+│   ├── Mobile-Agent-Bench（移动端）
+│   └── WebArena（浏览器自动化）
+├── Level 4: 安全与伦理（Safety）
+│   ├── 幻觉率（VIGIL 基准）
+│   ├── 偏见检测（Fairness benchmarks）
+│   └── 越狱/注入攻击防护
+└── Level 5: 综合评价（End-to-End）
+    ├── 任务成功率
+    ├── 平均操作步骤
+    ├── 人工满意度
+    └── 成本效益比
+```
+
+**主流基准一览（面试必背）：**
+
+<details>
+<summary>展开完整基准表（30 行）</summary>
+
+```
+基准名称                    评测方向             核心指标              难度
+──────────────────────────────────────────────────────────────────
+MMMU                      多学科推理            Acc@3                 ⭐⭐⭐⭐⭐
+MathVista                  数学+图表            Score(0-100)           ⭐⭐⭐⭐⭐
+ChartQA                    图表问答              Accuracy              ⭐⭐⭐⭐
+ScienceQA                  科学图文推理          Exact Match           ⭐⭐⭐⭐
+OSWorld                    GUI Agent            Task Success Rate     ⭐⭐⭐⭐⭐
+MobileBench                移动操作             Task Success Rate     ⭐⭐⭐⭐
+SEED-Bench                 通用多模态理解         MMLU-style            ⭐⭐⭐⭐⭐
+DocVQA                     文档理解              ANLS                  ⭐⭐⭐
+Video-MME                  视频理解              Average Score         ⭐⭐⭐⭐
+VIGIL                      多模态幻觉            Fidelity Categories   ⭐⭐⭐
+```
+
+</details>
+
+**自研多模态 Agent 评测方案（实战指南）：**
+
+<details>
+<summary>展开 Python 评测代码框架（45 行）</summary>
+
+```python
+class MultimodalEvaluator:
+    def __init__(self):
+        self.metrics = {
+            "perception": SelfAttentionMetric(),  # OCR/检测精度
+            "reasoning": CrossModalMetric(),     # 图文推理准确率
+            "interaction": ActionSuccessRate(),  # 操作成功率
+            "safety": HallucinationDetector(),   # 幻觉检测
+        }
+
+    def evaluate(self, test_cases: List[TestCase]) -> dict:
+        results = {}
+        for case in test_cases:
+            # 执行 Agent
+            output = self.agent.process(case.image, case.question)
+            
+            # 多维度打分
+            perception_score = self.metrics["perception"].check(output)
+            reasoning_score = self.metrics["reasoning"].check(output, case.golden)
+            interaction_score = self.metrics["interaction"].check(output)
+            safety_score = self.metrics["safety"].check(output)
+            
+            results[case.id] = {
+                "total": (perception_score + reasoning_score + 
+                         interaction_score + safety_score) / 4,
+                "breakdown": {
+                    "perception": perception_score,
+                    "reasoning": reasoning_score,
+                    "interaction": interaction_score,
+                    "safety": safety_score
+                }
+            }
+        
+        return {
+            "avg_overall": np.mean([r["total"] for r in results.values()]),
+            "by_dimension": {
+                k: np.mean([r["breakdown"][k] for r in results.values()])
+                for k in self.metrics.keys()
+            },
+            "per_case": results
+        }
+
+    # 关键：对比实验——不同模型在同一测试集上的得分
+    def compare_models(self, model_list, test_set):
+        for model in model_list:
+            self.agent.set_model(model)
+            score = self.evaluate(test_set)["avg_overall"]
+            print(f"{model}: {score:.2f}")
+```
+
+</details>
+
+**面试加分点：**
+
+- **不要只说"准确率"**——多模态评测需要分层：感知层（能不能看到）、推理层（能不能理解）、行为层（能不能执行）
+- **强调评测数据的地域/语言适配**——中文场景下英文基准的分数不代表中文真实水平
+- **提到"LLM as Judge"在多模态评测中的应用和局限性**——用另一个 LLM 来当裁判，便宜但有偏差
+
+**面试话术：**
+> "多模态评测我建议采用四层框架：感知层看 OCR 和检测准不准，推理层看 MMMU/MathVista 得分，交互层看 OSWorld/GUI 成功率，安全层看幻觉率和偏见。自测时我会搭建自己的评测集——既有标准基准的数据也要有真实场景的 corner case。记住一个关键原则：英文 benchmark 高分 ≠ 中文产品可用，一定要在自己目标语言和数据分布上做专项评测。"
+
+</details>
+
+---
+
+## 版本记录与更新
+
+- **v2.8** | 2026-09-18 | by 二狗子 🐕 | +6 题：Q17 视觉幻觉分类与检测 · Q18 CoVT · Q19 图像编辑 Agent · Q20 GenClaw vs RAG · Q21 空间定位 · Q22 音频/VLA · Q23 多模态评测基准
