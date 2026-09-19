@@ -1,3 +1,11 @@
+## 项目来源
+
+本项目基于以下开源项目进行学习：
+
+https://github.com/guocong-bincai/ai-interview-guide
+
+Original project by guocong-bincai, licensed under the MIT License.
+
 <p align="center">
   <b>简体中文</b> ·
   <a href="README_EN.md">English</a> ·
@@ -34,14 +42,6 @@
   <a href="https://github.com/guocong-bincai/ai-interview-guide/commits/main"><img src="https://img.shields.io/github/last-commit/guocong-bincai/ai-interview-guide?style=flat-square&color=059669" alt="Last Commit"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/guocong-bincai/ai-interview-guide?style=flat-square&color=f59e0b" alt="MIT License"></a>
 </p>
-
-## 项目来源
-
-本项目基于以下开源项目进行学习：
-
-https://github.com/guocong-bincai/ai-interview-guide
-
-Original project by guocong-bincai, licensed under the MIT License.
 
 > [!TIP]
 > **先选岗位，再走路线；先看图建立记忆，再用答案组织表达。** 这不是只为某一个职位准备的题库。无论你面试 AI 应用、RAG、Agent、模型训练与推理、FDE、多模态还是安全评测，都可以找到对应的专题组合、成长路线和高频考点。
